@@ -1,0 +1,50 @@
+[package]
+name = "samsung-frame"
+version = "0.1.0"
+description = "Manage Samsung The Frame TV art mode (upload, sync, slideshow, mattes) from Rust"
+license = "MIT"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+axum = "0.8.9"
+base64 = "0.23.1"
+chrono = "0.4.45"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+directories = "6.0.0"
+futures-util = "0.3.34"
+hex = "0.4.3"
+image = "0.25.10"
+kamadak-exif = "0.6.2"
+native-tls = "0.2.18"
+qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "native-tls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+socket2 = "0.6.5"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["full"] }
+tokio-native-tls = "0.3.1"
+tokio-tungstenite = { version = "0.30.0", features = ["native-tls"] }
+toml = "1.2.1"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+uuid = { version = "1.29.2", features = ["v4"] }
+walkdir = "2.5.0"
+
+[[bin]]
+name = "frametv"
+path = "src/bin/frametv/main.rs"
+
+# Image decoding/resizing is painfully slow unoptimized; optimize deps even in dev builds.
+[profile.dev.package."*"]
+opt-level = 3
+
+# HEIC/HEIF (iPhone photos) decoding: Windows Imaging Component on Windows, the system libheif
+# (>= 1.17) elsewhere: `apt install libheif-dev libheif-plugin-libde265` / `brew install libheif`.
+[target."cfg(windows)".dependencies]
+windows = { version = "0.62", features = ["Win32_Graphics_Imaging", "Win32_System_Com"] }
+
+[target."cfg(not(windows))".dependencies]
+libheif-rs = { version = "3.0.0", default-features = false, features = ["v1_17"] }

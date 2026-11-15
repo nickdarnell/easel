@@ -1,0 +1,15 @@
+# docker compose up -d   then open http://<this-machine>:8780 and set things up there.
+services:
+  easel:
+    image: ghcr.io/nickdarnell/easel:latest
+    build: .
+    container_name: easel
+    restart: unless-stopped
+    # Host networking lets the app find TVs, wake them, and show up in LocalSend.
+    network_mode: host
+    environment:
+      PUID: 1000   # user and group that own ./config (see `id -u`, `id -g`)
+      PGID: 1000
+    volumes:
+      # TVs, password, settings, thumbnails and received photos.
+      - ./config:/config
