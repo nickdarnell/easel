@@ -1347,7 +1347,7 @@ mod tests {
 
     #[test]
     fn share_card_renders() {
-        let jpeg = render_share_card("http://192.168.0.5:8780/tv/Living%20Room", 1920, 1080).unwrap();
+        let jpeg = render_share_card("http://192.168.0.5:3273/tv/Living%20Room", 1920, 1080).unwrap();
         let img = image::load_from_memory(&jpeg).unwrap();
         assert_eq!((img.width(), img.height()), (1920, 1080));
     }

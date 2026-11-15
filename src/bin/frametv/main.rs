@@ -213,7 +213,7 @@ enum Command {
     /// Everything else (admin password, share address, LocalSend) is set in the web app.
     Serve {
         /// Port for the web app.
-        #[arg(long, default_value_t = 8780)]
+        #[arg(long, default_value_t = 3273)]
         port: u16,
         /// Address to listen on (0.0.0.0 = reachable from phones on your network).
         #[arg(long, default_value = "0.0.0.0")]

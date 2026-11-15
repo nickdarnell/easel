@@ -47,7 +47,7 @@ pub struct ServerSettings {
     /// Admin password as `salt$sha256hex`. Delete this line to reset a forgotten password.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admin_password: Option<String>,
-    /// Base URL for share links and QR codes, e.g. `http://192.168.1.10:8780`.
+    /// Base URL for share links and QR codes, e.g. `http://192.168.1.10:3273`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_url: Option<String>,
     /// Advertise each TV as a LocalSend target.

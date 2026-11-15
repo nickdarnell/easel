@@ -40,14 +40,14 @@ docker run -d --name easel --restart unless-stopped --network host \
 of `id -u` and `id -g` for whoever should own `./config`. Everything else is configured in the
 web page and saved in `/config`:
 
-1. Open `http://<server-ip>:8780`.
+1. Open `http://<server-ip>:3273`.
 2. Choose **Add TV** and pick your TV (or type its IP). **The TV asks whether to allow
    "Easel"; press Allow with the remote.** You have about a minute, and you only do this once
    per TV.
 3. Open **App settings** (⚙) and set an admin password. Until you do, anyone on your network
    can delete photos or change settings.
 4. Click **Share…** on a TV to get its guest link and QR code, for example
-   `http://<server-ip>:8780/tv/Living%20Room`. **Show this QR code on the TV** puts the code
+   `http://<server-ip>:3273/tv/Living%20Room`. **Show this QR code on the TV** puts the code
    on the TV itself, so guests can scan it with their phone camera.
 
 The image is private while the repository is: run `docker login ghcr.io` first (a GitHub token
@@ -64,6 +64,10 @@ with `read:packages`), or build it yourself with `docker compose up -d --build`.
 
 On start, the container hands `/config` to `PUID:PGID` if anyone else owns it.
 
+The web app listens on port **3273**. If something else already uses it, add
+`command: ["--port", "8790"]` to the service (or put `--port 8790` after the image name with
+`docker run`).
+
 **Forgot the password?** Delete the `admin_password` line under `[server]` in
 `config/config.toml` and restart the container.
 
@@ -78,7 +82,7 @@ announcements, and it means share links show the server's real address. Host net
 a Linux Docker host (a home server, NAS, or Raspberry Pi). On Docker Desktop for
 Windows/macOS, host mode is limited, so expect to type TV IPs and miss Wake‑on‑LAN.
 
-Bridge networking (`-p 8780:8780 -p 53317:53317 -p 53317:53317/udp`) also works if you must.
+Bridge networking (`-p 3273:3273 -p 53317:53317 -p 53317:53317/udp`) also works if you must.
 Pairing by IP and uploads work, but discovery, Wake‑on‑LAN and LocalSend discovery don't. Set
 the **share address** in App settings so QR codes don't point at the container's private
 address.
@@ -133,7 +137,7 @@ frametv show <id> | delete <id…> | favorite <id>
 frametv slideshow [off|minutes] [--sequential]   frametv artmode [on|off]
 frametv mattes | matte <id> <matte>   frametv filters | filter <id> <filter>
 frametv settings | set <item> <value>   frametv wake   frametv key KEY_POWER
-frametv serve [--port 8780]        the web app (above)
+frametv serve [--port 3273]        the web app (above)
 ```
 
 Use `--tv NAME` (repeatable) or `--all` to target TVs, and `--wake` to wake a TV first.
@@ -147,7 +151,7 @@ on Linux.
 - **Turned off vs. art mode**: in art mode the TV answers normally. When it's fully off (or
   the motion sensor has blanked it), it shows as standby or off until woken.
 - **Windows firewall** (running `frametv serve` natively): allow `frametv.exe` on private
-  networks, or phones can't reach port 8780 / 53317.
+  networks, or phones can't reach port 3273 / 53317.
 - **Models**: tested with 2020 Frames (LS03T). 2022+ models use the same art API. Some 2024
   firmware dropped parts of it (e.g. slideshow/matte calls may be refused). Uploads and
   display work everywhere we know of.

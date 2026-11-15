@@ -1,4 +1,4 @@
-# docker compose up -d   then open http://<this-machine>:8780 and set things up there.
+# docker compose up -d   then open http://<this-machine>:3273 and set things up there.
 services:
   easel:
     image: ghcr.io/nickdarnell/easel:latest

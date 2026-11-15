@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# Easel: guests open http://<host>:8780/tv/<name> and send photos to that TV.
+# Easel: guests open http://<host>:3273/tv/<name> and send photos to that TV.
 # Everything (TVs, password, settings, received photos) lives in the /config volume.
 
 FROM rust:1-slim-trixie AS build
@@ -23,5 +23,5 @@ COPY --chmod=755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 ENV FRAMETV_DATA_DIR=/config \
     RUST_LOG=info
 VOLUME /config
-EXPOSE 8780/tcp 53317/tcp 53317/udp
+EXPOSE 3273/tcp 53317/tcp 53317/udp
 ENTRYPOINT ["docker-entrypoint.sh"]
