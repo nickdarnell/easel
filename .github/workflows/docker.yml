@@ -71,16 +71,39 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # The release version comes from Cargo.toml: bump it there and every build of main is tagged
+      # with it (0.1.2, 0.1 and 0), so you can pin a version and updaters notice new ones.
+      - id: version
+        run: |
+          v=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
+          echo "full=$v" >> "$GITHUB_OUTPUT"
+          echo "minor=${v%.*}" >> "$GITHUB_OUTPUT"
+          echo "major=${v%%.*}" >> "$GITHUB_OUTPUT"
       - id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ steps.version.outputs.full }},enable={{is_default_branch}}
+            type=raw,value=${{ steps.version.outputs.minor }},enable={{is_default_branch}}
+            type=raw,value=${{ steps.version.outputs.major }},enable={{is_default_branch}}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha
             type=ref,event=pr
+          # Standard OCI labels (source, revision, created) are added automatically; these fill in
+          # the rest, plus what Unraid and Watchtower look for.
+          labels: |
+            org.opencontainers.image.title=Easel
+            org.opencontainers.image.description=Photo manager for Samsung The Frame TVs: send photos from any phone on your Wi-Fi, frame them, and manage what's on each TV.
+            org.opencontainers.image.version=${{ steps.version.outputs.full }}
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.url=https://github.com/${{ github.repository }}
+            org.opencontainers.image.documentation=https://github.com/${{ github.repository }}#readme
+            net.unraid.docker.webui=http://[IP]:[PORT:3273]/
+            net.unraid.docker.icon=https://raw.githubusercontent.com/${{ github.repository }}/main/assets/icon.png
+            com.centurylinklabs.watchtower.enable=true
       - uses: docker/build-push-action@v6
         with:
           context: .

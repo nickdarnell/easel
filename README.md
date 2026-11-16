@@ -58,6 +58,12 @@ saved in `/config`:
 
 To build the image yourself instead of pulling it, run `docker compose up -d --build`.
 
+`latest` follows the main branch. To stay on a release line, use a version tag instead:
+`ghcr.io/nickdarnell/easel:0.1` (newest 0.1.x), `:0.1.0` (exactly that build), or `:0`. The
+version comes from `Cargo.toml`, and every build is also tagged `sha-<commit>`. The image
+carries the usual OCI labels, plus the web UI link and icon Unraid shows and Watchtower's
+enable label.
+
 ### What's in /config
 
 | Path | |

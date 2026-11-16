@@ -36,6 +36,8 @@ RUN find build.rs src web -type f -exec touch {} + \
  && cp target/release/frametv /usr/local/bin/frametv
 
 FROM debian:trixie-slim
+# CI adds the version, revision and build date on top of these (see .github/workflows/docker.yml).
+LABEL org.opencontainers.image.title="Easel"       org.opencontainers.image.description="Photo manager for Samsung The Frame TVs"       org.opencontainers.image.source="https://github.com/nickdarnell/easel"       org.opencontainers.image.licenses="MIT"       net.unraid.docker.webui="http://[IP]:[PORT:3273]/"       net.unraid.docker.icon="https://raw.githubusercontent.com/nickdarnell/easel/main/assets/icon.png"
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates libssl3t64 libheif1 libheif-plugin-libde265 \
  && rm -rf /var/lib/apt/lists/* \
