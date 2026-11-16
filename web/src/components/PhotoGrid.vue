@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // The photos on the selected TV. Admins can tick several (Select, or Ctrl/⌘/Shift-click) to act
 // on them together.
-import { computed, reactive, ref } from "vue";
+import { computed, ref } from "vue";
 import type { Filter, Photo, Tv } from "../types";
 import MatteSelect from "./MatteSelect.vue";
 import {
@@ -17,6 +17,7 @@ import {
   selection,
   setFilter,
   thumbUrl,
+  brokenThumbs,
   toggleSelected,
 } from "../state";
 import { ago } from "../util";
@@ -33,7 +34,7 @@ const current = computed(() => S.status?.current?.content_id);
 const on = computed(() => props.tv.power === "on");
 const loaded = (e: Event) => (e.target as HTMLImageElement).classList.add("loaded");
 /** Thumbnails the server couldn't get. */
-const broken = reactive(new Set<string>());
+const broken = brokenThumbs;
 
 const offlineText = computed(() => {
   const o = S.photosOffline;

@@ -158,8 +158,13 @@ Requests don't time out when a TV is slow or stuck. They wait while the server g
 and the page shows what it's doing ("Waking Fireplace…", with a timer). It reconnects first, then
 sends Wake‑on‑LAN. If that doesn't work, it turns the TV off and on again by holding the power
 button. Some Frames' art app stops answering until that happens. A restart happens at most once
-every 15 minutes, and a TV that says it's on (someone may be watching it) is only restarted for a
-command such as sending a photo.
+every 15 minutes. A TV that says it's on (someone may be watching it) is only restarted for a
+command such as sending a photo, or when a page has been waiting on it and a reconnect didn't help.
+
+Photo previews come from the TV, which only hands out thumbnails (there's no way to download the
+full photo back from it). If the TV is slow to send one, the page keeps waiting rather than giving
+up, and previews that arrive late are still kept. Photos sent from Easel get a preview made from the
+original if the TV has none.
 
 ## Command line
 

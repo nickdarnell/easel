@@ -31,6 +31,8 @@ pub const UPLOAD_CONFIRM_TIMEOUT: Duration = Duration::from_secs(60);
 /// 2022 Frames reset a secured transfer socket if we connect immediately.
 const SECURED_CONNECT_DELAY: Duration = Duration::from_secs(1);
 const THUMBNAIL_BATCH: usize = 20;
+/// How long to spend taking up a thumbnail offer that came too late.
+const LATE_TRANSFER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One `d2d_service_message` from the art app.
 #[derive(Debug, Clone, Serialize)]
@@ -163,11 +165,19 @@ impl Waiter {
     }
 }
 
+/// A recent request, to tell its reply from the TV's own news.
+struct Sent {
+    id: String,
+    request: String,
+    content_id: Option<String>,
+}
+
 struct Router {
     waiters: StdMutex<Vec<Waiter>>,
-    /// The ids of recent requests, to tell their replies from the TV's own news.
-    sent: StdMutex<std::collections::VecDeque<String>>,
+    sent: StdMutex<std::collections::VecDeque<Sent>>,
     events: broadcast::Sender<ArtMessage>,
+    /// Thumbnails that came after their request gave up waiting.
+    late: broadcast::Sender<Thumbnail>,
     serial: AtomicU64,
     closed: AtomicBool,
 }
@@ -184,6 +194,7 @@ impl Router {
     }
 
     fn dispatch(&self, incoming: Incoming) {
+        tracing::trace!(target: "samsung_frame::wire", "<- {}", incoming.json);
         let outer_event = incoming.json.get("event").and_then(Value::as_str).unwrap_or("*");
         match outer_event {
             events::D2D_SERVICE_MESSAGE => {}
@@ -202,8 +213,10 @@ impl Router {
         };
         let event = data.get("event").and_then(Value::as_str).unwrap_or("*").to_string();
         let request_id = str_field(&data, "request_id").or_else(|| str_field(&data, "id"));
-        let reply = request_id.as_deref().is_some_and(|id| self.sent.lock().unwrap().iter().any(|s| s == id));
-        let msg = ArtMessage { event, request_id, data, binary: incoming.binary, reply };
+        let asked = request_id.as_deref().and_then(|id| {
+            self.sent.lock().unwrap().iter().find(|s| s.id == id).map(|s| (s.request.clone(), s.content_id.clone()))
+        });
+        let msg = ArtMessage { event, request_id, data, binary: incoming.binary, reply: asked.is_some() };
         tracing::debug!("art event `{}` (request {:?})", msg.event, msg.request_id);
 
         let _ = self.events.send(msg.clone());
@@ -212,6 +225,16 @@ impl Router {
         if let Some(pos) = waiters.iter().position(|w| w.matches(&msg.event, msg.request_id.as_deref())) {
             let w = waiters.remove(pos);
             let _ = w.tx.send(msg);
+            return;
+        }
+        drop(waiters);
+        // Nobody's waiting any more. A thumbnail offer is still taken up: the TV holds its transfer
+        // socket open for us (and can stop answering meanwhile), and the thumbnail is worth having.
+        if let Some((request, content_id)) = asked
+            && request.starts_with("get_thumbnail")
+            && msg.event != "error"
+        {
+            tokio::spawn(collect_late(msg, request, content_id, self.late.clone()));
         }
     }
 
@@ -308,6 +331,39 @@ async fn d2d_connect(ci: &ConnInfo, secured: bool) -> Result<Box<dyn D2dStream>>
         Ok(Box::new(tls.connect(&ci.ip, tcp).await?))
     } else {
         Ok(Box::new(tcp))
+    }
+}
+
+/// Take up a thumbnail offer that came after its request gave up.
+async fn collect_late(msg: ArtMessage, request: String, asked: Option<String>, tx: broadcast::Sender<Thumbnail>) {
+    let label = asked.clone().unwrap_or_else(|| request.clone());
+    let files = if let Some(bytes) = msg.binary {
+        let file_type = if bytes.starts_with(b"\x89PNG") { "png" } else { "jpg" };
+        Ok(vec![Thumbnail { content_id: String::new(), file_type: file_type.into(), data: bytes }])
+    } else {
+        tokio::time::timeout(LATE_TRANSFER_TIMEOUT, async {
+            let ci = parse_conn_info(&msg.data)?;
+            // As when asked in time: `get_thumbnail` sockets are plain whatever they say.
+            let secured = ci.secured && request != "get_thumbnail";
+            let mut stream = d2d_connect(&ci, secured).await?;
+            read_d2d_files(stream.as_mut()).await
+        })
+        .await
+        .unwrap_or_else(|_| Err(Error::Timeout(LATE_TRANSFER_TIMEOUT, format!("late thumbnail ({label})"))))
+    };
+    match files {
+        Ok(files) => {
+            for mut f in files {
+                if f.content_id.is_empty()
+                    && let Some(id) = &asked
+                {
+                    f.content_id.clone_from(id);
+                }
+                tracing::info!("a late thumbnail came for {}", f.content_id);
+                let _ = tx.send(f);
+            }
+        }
+        Err(e) => tracing::debug!("late thumbnail ({label}): {e}"),
     }
 }
 
@@ -411,10 +467,12 @@ impl ArtClient {
 
         let (sink, stream) = ws.split();
         let (events_tx, _) = broadcast::channel(64);
+        let (late_tx, _) = broadcast::channel(64);
         let router = Arc::new(Router {
             waiters: StdMutex::new(Vec::new()),
             sent: StdMutex::new(std::collections::VecDeque::new()),
             events: events_tx,
+            late: late_tx,
             serial: AtomicU64::new(0),
             closed: AtomicBool::new(false),
         });
@@ -456,6 +514,11 @@ impl ArtClient {
         self.router.events.subscribe()
     }
 
+    /// Thumbnails the TV sent after their request had given up waiting for them.
+    pub fn late_thumbnails(&self) -> broadcast::Receiver<Thumbnail> {
+        self.router.late.subscribe()
+    }
+
     pub async fn close(self) {
         let _ = self.sink.lock().await.close().await;
     }
@@ -484,7 +547,11 @@ impl ArtClient {
             if sent.len() >= 256 {
                 sent.pop_front();
             }
-            sent.push_back(id.clone());
+            sent.push_back(Sent {
+                id: id.clone(),
+                request: name.clone(),
+                content_id: request.get("content_id").and_then(Value::as_str).map(str::to_owned),
+            });
         }
         let pending = self.router.register(Some(id), wait_event.map(str::to_owned))?;
         let envelope = protocol::art_request_envelope(&request);

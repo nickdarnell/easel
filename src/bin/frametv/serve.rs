@@ -520,7 +520,8 @@ impl Hub {
         // including the phone app): update what the server knows, and pass it on to the pages.
         // Answers to the server's own requests are left out.
         let mut rx = art.subscribe();
-        let (hub, name) = (Arc::clone(self), name.to_string());
+        let tv_name = name.to_string();
+        let (hub, name) = (Arc::clone(self), tv_name.clone());
         tokio::spawn(async move {
             loop {
                 match rx.recv().await {
@@ -534,6 +535,26 @@ impl Hub {
                         }
                         hub.refresh_status(&tv, Prio::Background);
                         hub.emit(ServerEvent::TvEvent { tv: name.clone(), event: m.event, data: m.data });
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                }
+            }
+        });
+        // Thumbnails that came too late for whoever asked: still worth keeping.
+        let mut late = art.late_thumbnails();
+        let (hub, name) = (Arc::clone(self), tv_name);
+        tokio::spawn(async move {
+            loop {
+                match late.recv().await {
+                    Ok(t) => {
+                        let Ok(tv) = hub.tv(&name) else { break };
+                        let id = thumb_id(&t.content_id).to_string();
+                        let dir = hub.thumb_dir(&tv);
+                        if !id.is_empty() && find_thumb(&dir, &id).is_none() && save_thumb(&tv, &dir, &id, t.data) {
+                            tv.no_thumb.lock().unwrap().remove(&id);
+                            hub.emit(ServerEvent::Thumbs { tv: name.clone(), ids: vec![id] });
+                        }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(_) => break,
@@ -642,7 +663,8 @@ impl Hub {
             tracing::info!("{}: {failure:#}; getting it to answer", tv.name);
             tv.art.lock().await.take();
             reconnected = false;
-            match self.recover(tv, prio == Prio::Command).await {
+            // A page that's waiting for it may restart the TV too, once nothing gentler worked.
+            match self.recover(tv, prio == Prio::Command || rounds > 0).await {
                 // It answers other requests, so it's this one it can't: asking again once is
                 // all that's worth doing.
                 Recovered::Fine if was_fine => return Err(failure),
@@ -1812,6 +1834,32 @@ fn find_thumb(dir: &Path, id: &str) -> Option<PathBuf> {
     ["jpg", "png"].iter().map(|e| dir.join(format!("{base}.{e}"))).find(|p| p.metadata().is_ok_and(|m| m.len() > 0))
 }
 
+/// Cache a thumbnail for `id`; `false` if it isn't an image or can't be written.
+fn save_thumb(tv: &Tv, dir: &Path, id: &str, data: Vec<u8>) -> bool {
+    let Some((data, ext)) = browser_image(data) else {
+        tracing::warn!("{}: the thumbnail for {id} isn't an image", tv.name);
+        return false;
+    };
+    for old in ["jpg", "png"] {
+        let _ = std::fs::remove_file(dir.join(format!("{}.{old}", safe_id(id))));
+    }
+    match std::fs::create_dir_all(dir).and_then(|()| std::fs::write(dir.join(format!("{}.{ext}", safe_id(id))), data)) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!("caching the thumbnail for {id}: {e}");
+            false
+        }
+    }
+}
+
+/// The photo a thumbnail's label names: the TV sometimes adds the file extension.
+fn thumb_id(label: &str) -> &str {
+    label
+        .rsplit_once('.')
+        .filter(|(_, ext)| ["jpg", "jpeg", "png"].iter().any(|e| ext.eq_ignore_ascii_case(e)))
+        .map_or(label, |(stem, _)| stem)
+}
+
 /// The thumbnail as a file the browser can show, with its extension: as sent if it's a JPEG or
 /// PNG, converted if it's some other image, `None` if it isn't one.
 fn browser_image(data: Vec<u8>) -> Option<(Vec<u8>, &'static str)> {
@@ -1855,26 +1903,10 @@ async fn fetch_thumbs(hub: &Shared, tv: &Arc<Tv>, ids: &[String], prio: Prio) ->
     if want.is_empty() {
         return Ok(cached);
     }
-    std::fs::create_dir_all(&dir)?;
-    let save = |id: &str, data: Vec<u8>| -> bool {
-        let Some((data, ext)) = browser_image(data) else {
-            tracing::warn!("{}: the thumbnail for {id} isn't an image", tv.name);
-            return false;
-        };
-        for old in ["jpg", "png"] {
-            let _ = std::fs::remove_file(dir.join(format!("{}.{old}", safe_id(id))));
-        }
-        match std::fs::write(dir.join(format!("{}.{ext}", safe_id(id))), data) {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::warn!("caching the thumbnail for {id}: {e}");
-                false
-            }
-        }
-    };
+    let save = |id: &str, data: Vec<u8>| save_thumb(tv, &dir, id, data);
     // Which photo each thumbnail is for: the TV labels them, but not always exactly as asked.
     let assign = |label: &str, asked: &[String]| -> Option<String> {
-        let stem = label.rsplit_once('.').map_or(label, |(s, _)| s);
+        let stem = thumb_id(label);
         asked
             .iter()
             .find(|id| id.as_str() == label || id.eq_ignore_ascii_case(stem))
@@ -1882,6 +1914,8 @@ async fn fetch_thumbs(hub: &Shared, tv: &Arc<Tv>, ids: &[String], prio: Prio) ->
             .cloned()
     };
 
+    // Set when the TV stopped answering: what's still missing then isn't known to have no preview.
+    let mut unanswered: Option<anyhow::Error> = None;
     let batch = hub
         .call(tv, prio, |a| {
             let want = want.clone();
@@ -1900,15 +1934,13 @@ async fn fetch_thumbs(hub: &Shared, tv: &Arc<Tv>, ids: &[String], prio: Prio) ->
                 }
             }
         }
-        // Couldn't reach the TV: nothing more to try now.
-        Err(e) if tv.down_reason().is_some() || e.downcast_ref::<samsung_frame::Error>().is_some_and(is_unanswered) => {
-            return if cached.is_empty() { Err(e) } else { Ok(cached) };
-        }
+        // Couldn't reach the TV: nothing more to ask it now.
+        Err(e) if unanswered_err(tv, &e) => unanswered = Some(e),
         Err(e) => tracing::warn!("{}: thumbnails for {want:?}: {e}", tv.name),
     }
 
     let mut missing: Vec<String> = want.into_iter().filter(|id| !cached.contains(id)).collect();
-    if !missing.is_empty() {
+    if !missing.is_empty() && unanswered.is_none() {
         for id in missing.clone() {
             let one = hub
                 .call(tv, prio, |a| {
@@ -1923,6 +1955,11 @@ async fn fetch_thumbs(hub: &Shared, tv: &Arc<Tv>, ids: &[String], prio: Prio) ->
                     {
                         cached.push(id.clone());
                     }
+                }
+                Err(e) if unanswered_err(tv, &e) => {
+                    tracing::info!("{}: the thumbnail for {id} didn't come: {e}", tv.name);
+                    unanswered = Some(e);
+                    break;
                 }
                 Err(e) => tracing::info!("{}: no thumbnail for {id} from the TV: {e}", tv.name),
             }
@@ -1957,6 +1994,11 @@ async fn fetch_thumbs(hub: &Shared, tv: &Arc<Tv>, ids: &[String], prio: Prio) ->
     for id in &cached {
         no_thumb.remove(id);
     }
+    if let Some(e) = unanswered {
+        // Not the photo's fault: ask again next time.
+        drop(no_thumb);
+        return if cached.is_empty() { Err(e) } else { Ok(cached) };
+    }
     for id in missing {
         tracing::warn!("{}: no thumbnail for {id}", tv.name);
         no_thumb.insert(id, Instant::now());
@@ -1964,11 +2006,19 @@ async fn fetch_thumbs(hub: &Shared, tv: &Arc<Tv>, ids: &[String], prio: Prio) ->
     Ok(cached)
 }
 
+/// Whether a failure means the TV didn't answer (as opposed to answering "no").
+fn unanswered_err(tv: &Tv, e: &anyhow::Error) -> bool {
+    tv.down_reason().is_some() || e.downcast_ref::<samsung_frame::Error>().is_some_and(is_unanswered)
+}
+
 async fn thumb(State(hub): State<Shared>, UrlPath((name, id)): UrlPath<(String, String)>) -> ApiResult<Response> {
     let tv = hub.tv(&name)?;
     let dir = hub.thumb_dir(&tv);
     if find_thumb(&dir, &id).is_none() {
-        fetch_thumbs(&hub, &tv, std::slice::from_ref(&id), Prio::Read).await?;
+        // The page asks again later; a 404 means the TV really has none.
+        fetch_thumbs(&hub, &tv, std::slice::from_ref(&id), Prio::Read).await.map_err(|e| {
+            ApiError(StatusCode::SERVICE_UNAVAILABLE, e.context(format!("{} didn't send the preview", tv.name)))
+        })?;
     }
     let path = find_thumb(&dir, &id)
         .ok_or_else(|| status_err(StatusCode::NOT_FOUND, format!("the TV has no preview of {id}")))?;

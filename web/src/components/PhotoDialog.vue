@@ -1,12 +1,24 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, onUnmounted, ref, watch } from "vue";
 import ModalDialog from "./ModalDialog.vue";
 import MatteSelect from "./MatteSelect.vue";
 import { openReframe } from "../composer";
-import { S, act, api, closeDialog, isAdmin, pending, showPhoto, thumbUrl, tvPath } from "../state";
+import {
+  S,
+  act,
+  api,
+  closeDialog,
+  isAdmin,
+  pending,
+  showPhoto,
+  thumbRev,
+  thumbUrl,
+  thumbsArrived,
+  tvPath,
+} from "../state";
 import { toast } from "../toasts";
 import type { Deleted, MatteUpdate, Toggle } from "../types";
-import { enc, prettyDate, prettyMatte } from "../util";
+import { enc, prettyDate, prettyMatte, sleep } from "../util";
 
 const props = defineProps<{ id: string }>();
 
@@ -16,7 +28,32 @@ const armed = ref(false);
 const path = (rest = "") => tvPath(S.tv!, `/photos/${enc(props.id)}${rest}`);
 const fav = S.filter === "favorites";
 
-const broken = ref(false);
+// The preview: shown, being waited for (the TV didn't send it yet), or one the TV doesn't have.
+const pic = ref<"ok" | "waiting" | "none">("ok");
+const why = ref("");
+let open = true;
+onUnmounted(() => (open = false));
+async function previewFailed() {
+  if (pic.value !== "ok") return;
+  pic.value = "waiting";
+  // Keep asking (the server waits for the TV) until it comes, or the TV says it has none.
+  while (open && pic.value === "waiting") {
+    const r = await fetch(thumbUrl(S.tv!, props.id), { cache: "no-store" }).catch(() => null);
+    if (pic.value !== "waiting") return;
+    if (r?.ok) return thumbsArrived([props.id]);
+    if (r?.status === 404) {
+      pic.value = "none";
+      return;
+    }
+    why.value = r ? ((await r.json().catch(() => null))?.error ?? "") : "";
+    await sleep(4000);
+  }
+}
+// It came (from here, or the server got it late): show it.
+watch(
+  () => thumbRev.get(props.id),
+  () => (pic.value = "ok"),
+);
 const shown = computed(() => S.status?.current?.content_id === props.id);
 const show = () => showPhoto(props.id);
 const applyMatte = () =>
@@ -50,8 +87,11 @@ function remove() {
   <ModalDialog v-if="photo" :title="photo.source || 'Photo'" wide>
     <div class="detail">
       <div class="pic">
-        <span v-if="broken" class="muted small">The TV has no preview of this photo.</span>
-        <img v-else :src="thumbUrl(S.tv!, photo.id)" alt="" @error="broken = true" />
+        <img v-if="pic === 'ok'" :src="thumbUrl(S.tv!, photo.id)" alt="" @error="previewFailed" />
+        <span v-else-if="pic === 'waiting'" class="muted small waiting" :title="why"
+          ><span class="spinner sm"></span>Waiting for {{ S.tv }} to send the preview…</span
+        >
+        <span v-else class="muted small">The TV has no preview of this photo.</span>
       </div>
       <div class="stack">
         <dl class="kv">

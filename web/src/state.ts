@@ -152,7 +152,14 @@ export async function api<T = unknown>(path: string, opts: ApiOptions = {}): Pro
 }
 
 export const tvPath = (tv: string, rest = "") => `/api/tvs/${enc(tv)}${rest}`;
-export const thumbUrl = (tv: string, id: string) => tvPath(tv, `/thumb/${enc(id)}`);
+/** Bumped for a photo when its preview arrives, so pages showing it load it again. */
+export const thumbRev = reactive(new Map<string, number>());
+/** Photos whose preview didn't load in the grid (until it arrives). */
+export const brokenThumbs = reactive(new Set<string>());
+export const thumbUrl = (tv: string, id: string) => {
+  const rev = thumbRev.get(id);
+  return tvPath(tv, `/thumb/${enc(id)}`) + (rev ? `?rev=${rev}` : "");
+};
 
 /** Run an action, showing any error as a toast. */
 export async function act(fn: () => Promise<unknown>) {
@@ -254,6 +261,8 @@ export function thumbsArrived(ids: string[]) {
   for (const id of ids) {
     const p = S.photos?.find((x) => x.id === id);
     if (p) p.thumb = true;
+    brokenThumbs.delete(id);
+    thumbRev.set(id, (thumbRev.get(id) ?? 0) + 1);
   }
 }
 
