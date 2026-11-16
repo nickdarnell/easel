@@ -25,13 +25,12 @@ const RETRY_MOST: Duration = Duration::from_secs(5 * 60);
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum Op {
-    /// Send a photo (already saved at `path`), and put it on the screen if `show`.
+    /// Send a photo (already saved at `path`) without selecting it.
     Upload {
         name: String,
         path: PathBuf,
         hash: String,
         framing: Option<Framing>,
-        show: bool,
         /// The file was saved for this upload (not already there), so dropping the upload
         /// removes it again.
         fresh: bool,
@@ -83,7 +82,6 @@ impl Op {
     pub fn describe(&self) -> String {
         let photos = |n: usize| if n == 1 { "1 photo".to_string() } else { format!("{n} photos") };
         match self {
-            Op::Upload { name, show: true, .. } => format!("Add {name} and show it"),
             Op::Upload { name, .. } => format!("Add {name}"),
             Op::Delete { ids } => format!("Delete {}", photos(ids.len())),
             Op::Matte { matte, .. } => format!("Set a photo's matte to {}", pretty_matte(matte)),
@@ -100,7 +98,7 @@ impl Op {
 
     fn to_api(&self) -> api::ChangeOp {
         match self.clone() {
-            Op::Upload { name, show, .. } => api::ChangeOp::Upload { name, show },
+            Op::Upload { name, .. } => api::ChangeOp::Upload { name },
             Op::Delete { ids } => api::ChangeOp::Delete { ids },
             Op::Matte { id, matte, portrait } => api::ChangeOp::Matte { id, matte, portrait },
             Op::Favorite { id, on } => api::ChangeOp::Favorite { id, on },
@@ -390,6 +388,18 @@ impl Outbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_upload_show_flag_is_ignored() {
+        let op: Op = serde_json::from_value(serde_json::json!({
+            "kind": "upload", "name": "photo.jpg", "path": "photo.jpg",
+            "hash": "abc", "framing": null, "show": true, "fresh": true
+        }))
+        .unwrap();
+        assert_eq!(op.describe(), "Add photo.jpg");
+        assert!(serde_json::to_value(&op).unwrap().get("show").is_none());
+        assert!(serde_json::to_value(op.to_api()).unwrap().get("show").is_none());
+    }
 
     /// A scratch folder, removed when dropped.
     struct Dir(PathBuf);

@@ -8,6 +8,7 @@ import {
   type SlideshowChoice,
   changes,
   endShare,
+  failedSlideshow,
   isAdmin,
   openDialog,
   openTvSettings,
@@ -31,9 +32,10 @@ const on = tvReady;
 const now = ref(Date.now());
 let tick: ReturnType<typeof setInterval> | undefined;
 watch(
-  () => !!activity.value,
+  () => !!activity.value || !!S.status?.estimated_next_change_at,
   (busy) => {
     clearInterval(tick);
+    now.value = Date.now();
     if (busy) tick = setInterval(() => (now.value = Date.now()), 1000);
   },
   { immediate: true },
@@ -101,6 +103,10 @@ const playing = computed(() => wanted.value.minutes > 0);
 const shown = computed(() => pending.slideshow ?? (playing.value ? wanted.value : draft));
 const intervals = computed(() => {
   const opts: [number, string][] = [
+    [1, "every minute"],
+    [3, "every 3 minutes"],
+    [5, "every 5 minutes"],
+    [10, "every 10 minutes"],
     [15, "every 15 minutes"],
     [60, "every hour"],
     [180, "every 3 hours"],
@@ -121,6 +127,8 @@ const slideshowText = computed(() => {
         ? "Changing the slideshow…"
         : "Starting the slideshow…";
   const w = waitingSlideshow.value;
+  if (failedSlideshow.value)
+    return failedSlideshow.value.error || "The TV could not apply the slideshow settings. Try another interval.";
   if (w)
     return w.minutes
       ? `Will play ${w.favorites ? "your favorites" : "all your photos"}, a new one ${every(w.minutes)}, when ${props.tv.name} answers.`
@@ -136,6 +144,15 @@ function change(patch: Partial<SlideshowChoice>) {
 }
 const play = () => setSlideshow({ ...draft, minutes: draft.minutes || 60 });
 const stop = () => setSlideshow({ ...wanted.value, minutes: 0 });
+const countdown = computed(() => {
+  if (!slideshow.value.minutes || pending.slideshow || waitingSlideshow.value || sharing.value) return "";
+  if (!on.value || S.status?.artmode !== true) return "Countdown paused while the TV isn't showing art.";
+  const next = S.status?.estimated_next_change_at;
+  if (!next) return "Waiting for a photo change to estimate the next one.";
+  const seconds = Math.ceil((next - now.value) / 1000);
+  if (seconds <= 0) return "Waiting for the TV's next photo change…";
+  return `Next photo in about ${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")} (estimated)`;
+});
 </script>
 
 <template>
@@ -203,7 +220,6 @@ const stop = () => setSlideshow({ ...wanted.value, minutes: 0 });
       <div class="send">
         <button class="primary big" @click="pick([tv.name])">Choose photos…</button>
         <button v-if="!on && tv.can_wake && isAdmin" @click="wake">Wake it up</button>
-        <label class="check"><input v-model="S.showNow" type="checkbox" /> Put it on the TV right away</label>
         <span class="hint"
           >Or drag photos anywhere onto this page.
           <a v-if="S.tvs.length > 1 && !S.guestTv" href="#" style="color: var(--accent)" @click.prevent="sendToAll"
@@ -221,6 +237,7 @@ const stop = () => setSlideshow({ ...wanted.value, minutes: 0 });
           <div class="grow">
             <div class="ss-title">Slideshow</div>
             <div class="muted small"><span v-if="pending.slideshow" class="spinner sm"></span>{{ slideshowText }}</div>
+            <div v-if="countdown" class="muted small">{{ countdown }}</div>
           </div>
           <button v-if="playing" :disabled="!!pending.slideshow" @click="stop">■ Stop</button>
           <button v-else class="primary" :disabled="!!pending.slideshow" @click="play">▶ Play</button>
@@ -250,6 +267,9 @@ const stop = () => setSlideshow({ ...wanted.value, minutes: 0 });
             />
             Shuffle</label
           >
+        </div>
+        <div class="muted small">
+          Short intervals depend on your TV model. The countdown estimates timing from photo changes.
         </div>
       </div>
 

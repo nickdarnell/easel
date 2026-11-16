@@ -61,14 +61,11 @@ pub struct ServerSettings {
     /// PIN LocalSend senders must enter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub localsend_pin: Option<String>,
-    /// Switch the TV to a photo as soon as it arrives over LocalSend.
-    #[serde(default = "yes")]
-    pub show_on_receive: bool,
 }
 
 impl Default for ServerSettings {
     fn default() -> Self {
-        Self { admin_password: None, public_url: None, localsend: true, localsend_pin: None, show_on_receive: true }
+        Self { admin_password: None, public_url: None, localsend: true, localsend_pin: None }
     }
 }
 
@@ -96,7 +93,7 @@ pub struct TvConfig {
     pub matte: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub portrait_matte: Option<String>,
-    /// Default fit for uploads (`auto`, `cover`, `contain`, `original`).
+    /// Default fit for uploads (`auto`, `cover`, `contain`, `blur`, `original`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fit: Option<String>,
 }

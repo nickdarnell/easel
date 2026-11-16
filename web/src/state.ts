@@ -37,15 +37,9 @@ export const S = reactive({
   pw: store.get("pw", ""),
   /** Set on `/tv/<name>`: the guest page for one TV. */
   guestTv: guestMatch ? decodeURIComponent(guestMatch[1]!) : null,
-  showNow: store.get("showNow", true),
   /** Changes waiting to be made on the TV, and what it's being asked right now. */
   queue: null as TvQueue | null,
 });
-
-watch(
-  () => S.showNow,
-  (v) => store.set("showNow", v),
-);
 
 /**
  * Changes sent to the TV that haven't shown up in what it reports yet. Controls show the new
@@ -298,7 +292,13 @@ export const waitingDeletes = computed(() => new Set(ofKind("delete").flatMap((c
 /** The slideshow as it'll be once the last waiting change to it is made. */
 export const waitingSlideshow = computed<SlideshowChoice | null>(() => {
   const c = ofKind("slideshow").at(-1);
-  return c ? { minutes: c.op.minutes ?? 0, shuffle: c.op.shuffle, favorites: c.op.favorites } : null;
+  return c && c.state !== "failed"
+    ? { minutes: c.op.minutes ?? 0, shuffle: c.op.shuffle, favorites: c.op.favorites }
+    : null;
+});
+export const failedSlideshow = computed(() => {
+  const c = ofKind("slideshow").at(-1);
+  return c?.state === "failed" ? c : null;
 });
 
 /** The waiting changes to one photo (matte, favorite, reframe, delete). */
@@ -379,8 +379,14 @@ export async function setSlideshow(want: SlideshowChoice) {
     });
     // Made whenever the TV answers: usually straight away.
     const made =
-      tvReady.value && (await settle(() => !waitingSlideshow.value && slideshow.value.minutes === want.minutes, 10));
-    if (!made && waitingSlideshow.value) toast(`The slideshow will change when ${S.tv} answers`);
+      tvReady.value &&
+      (await settle(
+        () => !!failedSlideshow.value || (!waitingSlideshow.value && slideshow.value.minutes === want.minutes),
+        10,
+      ));
+    if (failedSlideshow.value)
+      toast(failedSlideshow.value.error || "The TV could not apply the slideshow settings", true);
+    else if (!made && waitingSlideshow.value) toast(`The slideshow will change when ${S.tv} answers`);
     else if (!want.minutes) toast("Slideshow stopped");
     else toast(was ? "Slideshow updated" : "Slideshow started");
   });

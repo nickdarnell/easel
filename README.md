@@ -127,6 +127,9 @@ photo on a mock‑up of that TV's screen:
   mouse wheel, or a pinch.
 - **Show the whole photo**: nothing is cropped, and the TV puts a matte around it. Pick the
   matte style and color and see roughly how it will look.
+- **Blurred background**: keep the whole photo sharp over a blurred, screen-filling copy.
+  Works for portrait and wide photos, with no TV matte. You can also choose it as the TV's
+  usual framing, or apply it later with **Reframe…**. Originals are preserved.
 
 It starts from what the TV prefers (its per‑TV framing and matte settings, marked
 **Suggested**): photos close to the screen's shape fill it, others get a matte. With several
@@ -134,6 +137,20 @@ photos, a filmstrip lets you frame each one or **use this framing for all**.
 
 Changed your mind later? Open a photo and choose **Reframe…**. It goes back to the original,
 re‑uploads it with the new framing, and swaps it in (keeping it on screen if it was showing).
+
+## Slideshow timing
+
+Starting a shuffled slideshow chooses a random first photo from the selected collection,
+avoiding the TV's initial selection when there is another photo available. Changing just the
+interval does not choose a new starting photo. Easel checks that the TV kept both the interval
+and shuffle setting.
+
+The slideshow interval menu includes 1, 3, 5, and 10 minutes as well as longer durations.
+Supported intervals vary by TV model; a setting the TV does not keep is reported as failed.
+While watching a running slideshow, Easel estimates the next change after it observes a photo
+change. The countdown is approximate: the TV does not supply a remaining-time value through
+the slideshow status used here. It waits for another observed change after settings change or
+monitoring is interrupted, and never restarts just because you reopen the page.
 
 ## Changes wait for the TV
 
@@ -166,7 +183,9 @@ and TV; holding it turns the TV off. The arrow keys, Enter, and Backspace work t
 ## What guests see
 
 `/tv/<name>` is a single‑purpose page: a big **Choose photos…** button, the framing editor,
-and a "put it on the TV right away" toggle. Phones open their photo picker directly. Uploads show progress, and duplicates
+and uploads that leave the current photo alone. To display a photo, use **Show on the TV**
+afterward. This also applies to LocalSend and command-line uploads. Phones open their photo
+picker directly. Uploads show progress, and duplicates
 are recognized ("Already on the TV"). iPhone HEIC photos work: Safari sends JPEG anyway, and the
 Docker image decodes HEIC with libheif.
 
@@ -202,7 +221,7 @@ frametv discover [--scan]          find TVs (SSDP, or probe the /24)
 frametv pair <ip> [--name N]       press Allow on the TV
 frametv tvs | configure <tv> … | forget <tv>
 frametv status | list | current | thumbs | watch
-frametv upload <files…> [--show] [--matte auto|none|shadowbox_polar…] [--fit auto|cover|contain|original]
+frametv upload <files…> [--matte auto|none|shadowbox_polar…] [--fit auto|cover|contain|blur|original]
 frametv sync [folder] [--delete] [--dry-run]
 frametv show <id> | delete <id…> | favorite <id>
 frametv slideshow [off|minutes] [--sequential]   frametv artmode [on|off]

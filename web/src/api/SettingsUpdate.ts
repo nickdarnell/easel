@@ -7,4 +7,4 @@ export type SettingsUpdate = {
 /**
  * The new admin password; empty removes it.
  */
-password?: string, public_url?: string, localsend?: boolean, localsend_pin?: string, show_on_receive?: boolean, };
+password?: string, public_url?: string, localsend?: boolean, localsend_pin?: string, };

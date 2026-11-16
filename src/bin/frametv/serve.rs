@@ -93,6 +93,27 @@ const LONGEST_HOLD: Duration = Duration::from_secs(10);
 /// look at: it sometimes says no while it's busy.
 const REJECTIONS_BEFORE_FAILING: u32 = 3;
 
+/// Keep an estimate only across uninterrupted observations of the same running slideshow.
+fn estimate_next_change(previous: Option<&api::Status>, current: &api::Status, now: u64) -> Option<u64> {
+    let previous = previous?;
+    let minutes = current.slideshow.as_ref()?.minutes.filter(|m| *m > 0)?;
+    if current.artmode != Some(true)
+        || previous.artmode != Some(true)
+        || current.sharing
+        || previous.sharing
+        || current.slideshow != previous.slideshow
+    {
+        return None;
+    }
+    let photo = current.current.as_ref()?;
+    let old = previous.current.as_ref()?;
+    if photo.content_id == old.content_id {
+        previous.estimated_next_change_at
+    } else {
+        Some(now.saturating_add(u64::from(minutes) * 60_000))
+    }
+}
+
 tokio::task_local! {
     /// Set while retrying a waiting change by itself: the TV isn't woken or restarted for it,
     /// it only goes ahead if the TV answers.
@@ -950,7 +971,7 @@ impl Hub {
                 }
             })
             .await?;
-        let status = api::Status {
+        let mut status = api::Status {
             loaded: true,
             artmode,
             current: current.map(|c| api::Current { content_id: c.content_id }),
@@ -961,9 +982,12 @@ impl Hub {
             }),
             sharing: self.share_session(tv).is_some(),
             activity: None,
+            estimated_next_change_at: None,
         };
         let changed = {
             let mut slot = tv.status.lock().unwrap();
+            let previous = slot.as_ref().filter(|(_, at)| at.elapsed() < WATCH_STATUS_EVERY * 2);
+            status.estimated_next_change_at = estimate_next_change(previous.map(|(s, _)| s), &status, cache::now_ms());
             let changed = slot.as_ref().is_none_or(|(s, _)| *s != status);
             *slot = Some((status, Instant::now()));
             changed
@@ -1201,31 +1225,28 @@ impl Hub {
     }
 
     /// Save an incoming photo next to the TV's synced photos (or under `photos/<tv>`), and
-    /// queue it to be sent (and shown, if `show`) whenever the TV answers. Returns the change.
+    /// queue it to be sent without selecting it whenever the TV answers. Returns the change.
     fn ingest(
         self: &Arc<Self>,
         tv: &Arc<Tv>,
         file_name: &str,
         data: &[u8],
-        show: bool,
         framing: Option<Framing>,
     ) -> anyhow::Result<u64> {
         let cfg = tv.config();
         let dir = cfg.folder.clone().unwrap_or_else(|| self.data_dir.join("photos").join(&tv.name));
         let hash = hex::encode(Sha256::digest(data));
         let (path, fresh) = save_unique(&dir, &localsend::sanitize_file_name(file_name), data, &hash)?;
-        Ok(self.enqueue(tv, Op::Upload { name: file_name.to_owned(), path, hash, framing, show, fresh }))
+        Ok(self.enqueue(tv, Op::Upload { name: file_name.to_owned(), path, hash, framing, fresh }))
     }
 
-    /// Send a saved photo to the TV unless it is already there with the same framing, and
-    /// optionally display it.
+    /// Send a saved photo to the TV unless it is already there with the same framing.
     async fn send_photo(
         self: &Arc<Self>,
         tv: &Arc<Tv>,
         file_name: &str,
         path: &Path,
         hash: &str,
-        show: bool,
         framing: Option<Framing>,
     ) -> anyhow::Result<api::Uploaded> {
         let cfg = tv.config();
@@ -1266,18 +1287,9 @@ impl Hub {
             state.save(&state_file)?;
             (result.content_id, false)
         };
-        // Sent, even if showing it fails: trying again then finds it already there.
+        // Refresh the photo list without selecting the uploaded photo.
         tv.photos_changed();
-        if show {
-            let id = content_id.clone();
-            self.with_art(tv, |a| {
-                let id = id.clone();
-                async move { a.select_image(&id, None, true).await }
-            })
-            .await?;
-            self.status_changed(tv);
-        }
-        let photo = api::Uploaded { content_id, name: file_name.to_owned(), duplicate, shown: show };
+        let photo = api::Uploaded { content_id, name: file_name.to_owned(), duplicate, shown: false };
         self.emit(ServerEvent::Uploaded { tv: tv.name.clone(), photo: photo.clone() });
         Ok(photo)
     }
@@ -1384,11 +1396,11 @@ impl Hub {
     /// Make one change on the TV.
     async fn apply(self: &Arc<Self>, tv: &Arc<Tv>, change: &Change) -> Outcome {
         let result: anyhow::Result<()> = match change.op.clone() {
-            Op::Upload { name, path, hash, framing, show, .. } => {
+            Op::Upload { name, path, hash, framing, .. } => {
                 if !path.is_file() {
                     return Outcome::Failed(format!("the photo ({}) is gone from the server", path.display()));
                 }
-                self.send_photo(tv, &name, &path, &hash, show, framing).await.map(drop)
+                self.send_photo(tv, &name, &path, &hash, framing).await.map(drop)
             }
             Op::Delete { ids } => delete_photos(self, tv, ids.clone()).await.map(|_| {
                 let dropped = self.with_outbox(tv, |ob| ob.forget(&ids));
@@ -1411,9 +1423,19 @@ impl Hub {
             Op::Slideshow { minutes, shuffle, favorites } => {
                 let cat = if favorites { category::FAVORITES } else { category::MY_PHOTOS };
                 let minutes = minutes.filter(|m| *m > 0);
-                self.with_art(tv, |a| async move { a.set_slideshow(minutes, shuffle, cat).await })
-                    .await
-                    .map(|()| self.status_changed(tv))
+                let applied =
+                    self.with_art(tv, |a| async move { a.configure_slideshow(minutes, shuffle, cat).await }).await;
+                self.status_changed(tv);
+                match applied {
+                    Ok(actual) if actual.minutes != minutes => return Outcome::Failed(
+                        "The TV did not keep the requested slideshow interval. Try another duration supported by this model.".into(),
+                    ),
+                    Ok(actual) if minutes.is_some() && actual.shuffle != shuffle => return Outcome::Failed(
+                        "The TV did not keep the requested shuffle setting. Please try again.".into(),
+                    ),
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(e),
+                }
             }
             Op::Reframe { id, framing } => match reframe_photo(Arc::clone(self), Arc::clone(tv), id, framing).await {
                 Ok(r) => {
@@ -1694,11 +1716,9 @@ async fn start_localsend(hub: &Shared, pin: Option<String>) -> anyhow::Result<lo
     tokio::spawn(async move {
         while let Some(file) = rx.recv().await {
             let Some((_, tvs)) = targets.get(file.device) else { continue };
-            let show = hub.server_settings().show_on_receive;
             tracing::info!("received {} from {} via LocalSend", file.file_name, file.sender_alias);
             for tv in tvs {
-                let show = show && file.last_in_session;
-                if let Err(e) = hub.ingest(tv, &file.file_name, &file.data, show, None) {
+                if let Err(e) = hub.ingest(tv, &file.file_name, &file.data, None) {
                     let message = format!("{} from {}: {e:#}", file.file_name, file.sender_alias);
                     hub.emit(ServerEvent::Error { tv: tv.name.clone(), message });
                 }
@@ -1772,7 +1792,6 @@ fn settings(hub: &Hub) -> api::Settings {
         public_url: s.public_url,
         localsend: s.localsend,
         localsend_pin: s.localsend_pin,
-        show_on_receive: s.show_on_receive,
         localsend_targets: hub.localsend.lock().unwrap().clone(),
         localsend_error: hub.localsend_error.lock().unwrap().clone(),
         in_docker: Path::new("/.dockerenv").exists(),
@@ -1819,9 +1838,6 @@ async fn put_settings(
         }
         if let Some(p) = &b.localsend_pin {
             s.localsend_pin = blank_to_none(p);
-        }
-        if let Some(v) = b.show_on_receive {
-            s.show_on_receive = v;
         }
     })?;
     let after = hub.server_settings();
@@ -2334,7 +2350,6 @@ async fn thumb(State(hub): State<Shared>, UrlPath((name, id)): UrlPath<(String, 
 #[derive(Deserialize)]
 struct UploadQuery {
     name: Option<String>,
-    show: Option<bool>,
     /// Explicit framing: `cover` (fill the screen) or `contain` (whole photo with a matte).
     fit: Option<String>,
     /// `x,y,w,h` fractions of the photo to keep.
@@ -2375,8 +2390,7 @@ async fn upload(
     }
     let framing = q.framing()?;
     let file_name = q.name.unwrap_or_else(|| format!("photo-{}.jpg", chrono::Local::now().format("%Y%m%d-%H%M%S")));
-    let show = q.show.unwrap_or(false);
-    let change = tokio::task::spawn_blocking(move || hub.ingest(&tv, &file_name, &body, show, framing)).await??;
+    let change = tokio::task::spawn_blocking(move || hub.ingest(&tv, &file_name, &body, framing)).await??;
     Ok(queued(change))
 }
 
@@ -2973,6 +2987,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn slideshow_estimate_tracks_observed_changes_only() {
+        let mut old = api::Status {
+            artmode: Some(true),
+            current: Some(api::Current { content_id: "one".into() }),
+            slideshow: Some(api::Slideshow { minutes: Some(1), shuffle: true, favorites: false }),
+            ..Default::default()
+        };
+        let mut next = old.clone();
+        assert_eq!(estimate_next_change(None, &next, 1000), None);
+        assert_eq!(estimate_next_change(Some(&old), &next, 1000), None);
+        next.current.as_mut().unwrap().content_id = "two".into();
+        assert_eq!(estimate_next_change(Some(&old), &next, 1000), Some(61_000));
+        next.estimated_next_change_at = Some(61_000);
+        old = next.clone();
+        // Polling, even after the estimate expires, never restarts the countdown.
+        assert_eq!(estimate_next_change(Some(&old), &next, 70_000), Some(61_000));
+        next.slideshow.as_mut().unwrap().minutes = Some(3);
+        assert_eq!(estimate_next_change(Some(&old), &next, 2000), None);
+        next = old.clone();
+        next.artmode = Some(false);
+        assert_eq!(estimate_next_change(Some(&old), &next, 2000), None);
+        next = old.clone();
+        next.sharing = true;
+        assert_eq!(estimate_next_change(Some(&old), &next, 2000), None);
+        next = old.clone();
+        next.slideshow.as_mut().unwrap().minutes = None;
+        assert_eq!(estimate_next_change(Some(&old), &next, 2000), None);
+    }
+
+    #[test]
     fn save_unique_dedupes_and_renames() {
         let dir = std::env::temp_dir().join(format!("frametv-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -3000,7 +3044,6 @@ mod tests {
     fn upload_query_framing() {
         let q = UploadQuery {
             name: None,
-            show: None,
             fit: Some("cover".into()),
             crop: Some("0.1,0,0.8,1".into()),
             matte: Some(String::new()),
@@ -3009,7 +3052,7 @@ mod tests {
         assert_eq!(f.fit, image_prep::Fit::Cover);
         assert_eq!(f.crop.unwrap().w, 0.8);
         assert_eq!(f.matte, None);
-        let q = UploadQuery { fit: None, crop: None, matte: None, name: None, show: None };
+        let q = UploadQuery { fit: None, crop: None, matte: None, name: None };
         assert!(q.framing().ok().flatten().is_none());
     }
 

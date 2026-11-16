@@ -15,7 +15,6 @@ const removePassword = ref(false);
 const publicUrl = ref(s.public_url || "");
 const localsend = ref(s.localsend);
 const pin = ref(s.localsend_pin || "");
-const showOnReceive = ref(s.show_on_receive);
 const origin = location.origin;
 const aliases = computed(() => s.localsend_targets.map((t) => `“${t.alias}”`).join(", "));
 
@@ -25,7 +24,6 @@ const save = () =>
       public_url: publicUrl.value.trim(),
       localsend: localsend.value,
       localsend_pin: pin.value.trim(),
-      show_on_receive: showOnReceive.value,
     };
     let newPw: string | undefined;
     if (removePassword.value) newPw = "";
@@ -76,9 +74,6 @@ const save = () =>
       <div class="stack">
         <label class="check"><input v-model="localsend" type="checkbox" /> List each TV in the LocalSend app</label>
         <input v-model="pin" type="text" placeholder="PIN senders must enter (optional)" />
-        <label class="check"
-          ><input v-model="showOnReceive" type="checkbox" /> Switch the TV to photos as they arrive</label
-        >
         <span v-if="s.localsend_error" class="small" style="color: var(--danger)">{{ s.localsend_error }}</span>
         <span v-else-if="s.localsend_targets.length" class="muted small">Showing up as {{ aliases }}.</span>
         <span v-else-if="s.localsend" class="muted small">Starts once a TV is paired.</span>

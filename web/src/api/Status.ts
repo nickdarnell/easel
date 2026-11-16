@@ -13,6 +13,11 @@ export type Status = {
  */
 loaded: boolean, artmode: boolean | null, current: Current | null, slideshow: Slideshow | null, 
 /**
+ * Estimated next change, in Unix milliseconds, based on an observed photo change.
+ * Not a timer reported by the TV; null until timing can be estimated.
+ */
+estimated_next_change_at: number | null, 
+/**
  * A QR code card is up on the TV (see `POST .../share-card`).
  */
 sharing: boolean, 

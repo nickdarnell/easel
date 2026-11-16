@@ -11,6 +11,7 @@ const fitOptions: [string, string][] = [
   ["", "Automatic: fill the screen when the photo is close to its shape"],
   ["cover", "Fill the screen (crop, no border)"],
   ["contain", "Show the whole photo (with a border)"],
+  ["blur", "Show the whole photo (blurred background)"],
   ["original", "Leave as is"],
 ];
 const fit = ref(tv.fit || "");

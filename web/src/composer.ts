@@ -83,7 +83,7 @@ export async function openReframe(p: Photo) {
       frameDefaults(it, tv);
       const f = p.framing;
       if (f) {
-        it.mode = f.fit === "cover" ? "fill" : "whole";
+        it.mode = f.fit === "blur" ? "blur" : f.fit === "cover" ? "fill" : "whole";
         if (f.crop) setFromCrop(it, f.crop, pa);
         if (f.matte && f.matte !== "none" && f.matte !== "auto") it.matte = f.matte;
       } else if (p.matte) {

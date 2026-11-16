@@ -55,7 +55,6 @@ pub struct Settings {
     pub public_url: Option<String>,
     pub localsend: bool,
     pub localsend_pin: Option<String>,
-    pub show_on_receive: bool,
     pub localsend_targets: Vec<LocalSendTarget>,
     /// Why LocalSend couldn't start, if it couldn't.
     pub localsend_error: Option<String>,
@@ -111,6 +110,10 @@ pub struct Status {
     pub artmode: Option<bool>,
     pub current: Option<Current>,
     pub slideshow: Option<Slideshow>,
+    /// Estimated next change, in Unix milliseconds, based on an observed photo change.
+    /// Not a timer reported by the TV; null until timing can be estimated.
+    #[ts(type = "number | null")]
+    pub estimated_next_change_at: Option<u64>,
     /// A QR code card is up on the TV (see `POST .../share-card`).
     pub sharing: bool,
     /// What the server is doing to get the TV to answer, while it's at it. Requests for the TV
@@ -287,7 +290,6 @@ pub enum ChangeOp {
     /// A photo to add (`GET .../queue/{id}/preview` shows it).
     Upload {
         name: String,
-        show: bool,
     },
     Delete {
         ids: Vec<String>,
@@ -446,7 +448,6 @@ pub struct SettingsUpdate {
     pub public_url: Option<String>,
     pub localsend: Option<bool>,
     pub localsend_pin: Option<String>,
-    pub show_on_receive: Option<bool>,
 }
 
 /// `POST /api/tvs` (admin): pair a TV. Someone has to press Allow on it.

@@ -11,7 +11,6 @@ export interface QueueItem {
   file: File;
   framing: Framing | null;
   tv: string;
-  show: boolean;
   status: QueueStatus;
   pct: number;
   msg: string;
@@ -30,12 +29,11 @@ export interface Entry {
 export function enqueue(entries: Entry[], tvs: string[]) {
   if (!entries.length) return;
   for (const tv of tvs) {
-    entries.forEach((e, i) =>
+    entries.forEach((e) =>
       queue.items.push({
         file: e.file,
         framing: e.framing,
         tv,
-        show: S.showNow && i === entries.length - 1,
         status: "queued",
         pct: 0,
         msg: "Waiting",
@@ -98,7 +96,7 @@ async function sendOne(item: QueueItem): Promise<Queued> {
   return new Promise((resolve, reject) => {
     const x = new XMLHttpRequest();
     const fr = item.framing;
-    let qs = `name=${enc(f.name)}&show=${item.show}`;
+    let qs = `name=${enc(f.name)}`;
     if (fr) {
       qs += `&fit=${fr.fit}&matte=${enc(fr.matte || "")}`;
       if (fr.crop) qs += `&crop=${[fr.crop.x, fr.crop.y, fr.crop.w, fr.crop.h].join(",")}`;

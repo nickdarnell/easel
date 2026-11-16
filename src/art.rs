@@ -139,6 +139,14 @@ pub struct SlideshowStatus {
     pub raw: Value,
 }
 
+/// Choose from eligible entries, avoiding the TV's initial selection when possible.
+fn shuffle_start<'a>(items: &'a [ArtItem], current: Option<&str>, random: u128) -> Option<&'a ArtItem> {
+    let eligible: Vec<_> = items.iter().filter(|i| !i.content_id.is_empty()).collect();
+    let alternatives: Vec<_> = eligible.iter().copied().filter(|i| Some(i.content_id.as_str()) != current).collect();
+    let pool = if alternatives.is_empty() { &eligible } else { &alternatives };
+    if pool.is_empty() { None } else { Some(pool[(random % pool.len() as u128) as usize]) }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Reply routing
 // ---------------------------------------------------------------------------------------------
@@ -951,6 +959,35 @@ impl ArtClient {
         Ok(())
     }
 
+    /// Apply a user's slideshow choice, randomizing the first photo on a new shuffled run.
+    /// Interval-only changes preserve the current photo. Internal pause/resume uses
+    /// `set_slideshow` directly so it can restore the previous photo instead.
+    pub async fn configure_slideshow(
+        &self,
+        minutes: Option<u32>,
+        shuffle: bool,
+        category: &str,
+    ) -> Result<SlideshowStatus> {
+        let starting = if shuffle && minutes.is_some_and(|m| m > 0) {
+            let before = self.slideshow_status().await?;
+            before.minutes.is_none() || !before.shuffle || before.category_id.as_deref() != Some(category)
+        } else {
+            false
+        };
+        // Read candidates before changing the TV, so a failed list request leaves it alone.
+        let items = if starting { self.content_list(Some(category)).await? } else { vec![] };
+        self.set_slideshow(minutes, shuffle, category).await?;
+        let actual = self.slideshow_status().await?;
+        if starting && actual.minutes == minutes && actual.shuffle && !items.is_empty() {
+            let current = self.current_artwork().await?;
+            if let Some(first) = shuffle_start(&items, Some(&current.content_id), uuid::Uuid::new_v4().as_u128()) {
+                self.select_image(&first.content_id, Some(category), true).await?;
+                return self.slideshow_status().await;
+            }
+        }
+        Ok(actual)
+    }
+
     // ---- settings ----------------------------------------------------------------------------
 
     /// Art mode settings: brightness, color_temperature, motion_sensitivity, motion_timer,
@@ -1067,6 +1104,27 @@ mod lenient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shuffled_start_avoids_current_and_can_choose_every_alternative() {
+        let items: Vec<_> = ["one", "two", "three", ""]
+            .into_iter()
+            .map(|id| ArtItem { content_id: id.into(), ..Default::default() })
+            .collect();
+        for seed in 0..20 {
+            let chosen = shuffle_start(&items, Some("one"), seed).unwrap();
+            assert_eq!(chosen.content_id, if seed % 2 == 0 { "two" } else { "three" });
+        }
+        for seed in 0..3 {
+            assert_eq!(
+                shuffle_start(&items, Some("outside-this-album"), seed).unwrap().content_id,
+                items[seed as usize].content_id
+            );
+        }
+        assert_eq!(shuffle_start(&items[..1], Some("one"), 99).unwrap().content_id, "one");
+        assert!(shuffle_start(&[], None, 0).is_none());
+        assert!(shuffle_start(&items[3..], None, 0).is_none());
+    }
 
     fn waiter(id: Option<&str>, event: Option<&str>) -> Waiter {
         let (tx, _rx) = oneshot::channel();

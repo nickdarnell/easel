@@ -4,7 +4,7 @@ use samsung_frame::image_prep::{PrepOptions, prepare_file};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let [input, output, rest @ ..] = args.as_slice() else {
-        eprintln!("usage: prep <input> <output.jpg> [auto|cover|contain|original] [WxH]");
+        eprintln!("usage: prep <input> <output.jpg> [auto|cover|contain|blur|original] [WxH]");
         std::process::exit(2);
     };
     let mut opts = PrepOptions::default();

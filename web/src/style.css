@@ -725,6 +725,13 @@ dialog.composer {
   position: absolute;
   inset: 0;
 }
+.stage .blur-background {
+  inset: -5%;
+  width: 110%;
+  height: 110%;
+  object-fit: cover;
+  filter: blur(12px);
+}
 .stage .shade {
   position: absolute;
   pointer-events: none;

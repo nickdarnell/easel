@@ -4,7 +4,7 @@ import type { LocalSendTarget } from "./LocalSendTarget";
 /**
  * `GET /api/settings` (admin): the server-wide settings.
  */
-export type Settings = { password_set: boolean, public_url: string | null, localsend: boolean, localsend_pin: string | null, show_on_receive: boolean, localsend_targets: Array<LocalSendTarget>, 
+export type Settings = { password_set: boolean, public_url: string | null, localsend: boolean, localsend_pin: string | null, localsend_targets: Array<LocalSendTarget>, 
 /**
  * Why LocalSend couldn't start, if it couldn't.
  */

@@ -225,11 +225,19 @@ pub async fn upload_file(art: &ArtClient, path: &Path, settings: &UploadSettings
         .await
         .map_err(|e| Error::Other(format!("image task failed: {e}")))??;
     let panel = (settings.prep.width, settings.prep.height);
-    let matte = resolve_matte(&settings.matte, &prepared, panel);
+    let matte = if settings.prep.fit == image_prep::Fit::Blur {
+        "none".into()
+    } else {
+        resolve_matte(&settings.matte, &prepared, panel)
+    };
     let opts = UploadOptions {
         file_type: prepared.file_type.to_string(),
         matte: matte.clone(),
-        portrait_matte: settings.portrait_matte.clone(),
+        portrait_matte: if settings.prep.fit == image_prep::Fit::Blur {
+            "none".into()
+        } else {
+            settings.portrait_matte.clone()
+        },
         image_date: prepared.image_date.clone(),
         ..Default::default()
     };

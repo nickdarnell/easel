@@ -83,7 +83,7 @@ enum Command {
         matte: Option<String>,
         #[arg(long)]
         portrait_matte: Option<String>,
-        /// Default fit: auto, cover, contain, original.
+        /// Default fit: auto, cover, contain, blur, original.
         #[arg(long)]
         fit: Option<Fit>,
         #[arg(long)]
@@ -112,7 +112,7 @@ enum Command {
     Upload {
         #[arg(required = true)]
         paths: Vec<PathBuf>,
-        /// auto, cover, contain, original.
+        /// auto, cover, contain, blur, original.
         #[arg(long)]
         fit: Option<Fit>,
         /// Matte id or `auto` (none when it fills the screen, white shadowbox otherwise).
@@ -120,9 +120,6 @@ enum Command {
         matte: Option<String>,
         #[arg(long)]
         portrait_matte: Option<String>,
-        /// Display the (last) uploaded image right away.
-        #[arg(long)]
-        show: bool,
     },
     /// Mirror a folder to My Photos (uploads new images; `--delete` removes ones you deleted).
     Sync {
@@ -538,7 +535,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Command::Upload { paths, fit, matte, portrait_matte, show } => {
+        Command::Upload { paths, fit, matte, portrait_matte } => {
             let files = expand_paths(&paths)?;
             if files.is_empty() {
                 bail!("no supported images found");
@@ -548,7 +545,6 @@ async fn run(cli: Cli) -> Result<()> {
                 let art = app.connect(&tv).await?;
                 let state_file = app.state_file(&tv);
                 let mut state = TvState::load(&state_file)?;
-                let mut last = None;
                 for (i, path) in files.iter().enumerate() {
                     eprint!("[{}/{}] {} → {} ... ", i + 1, files.len(), path.display(), tv.name);
                     match sync::upload_file(&art, path, &settings).await {
@@ -566,13 +562,9 @@ async fn run(cli: Cli) -> Result<()> {
                             if app.json {
                                 println!("{}", json!({"tv": tv.name, "path": path, "content_id": r.content_id}));
                             }
-                            last = Some(r.content_id);
                         }
                         Err(e) => eprintln!("failed: {e}"),
                     }
-                }
-                if show && let Some(id) = last {
-                    art.select_image(&id, None, true).await?;
                 }
             }
             Ok(())
@@ -657,8 +649,15 @@ async fn run(cli: Cli) -> Result<()> {
                         }
                     }
                     Some(v) => {
-                        let minutes = if v.eq_ignore_ascii_case("off") { None } else { Some(parse_interval(v)?) };
-                        art.set_slideshow(minutes, !sequential, &cat).await?;
+                        let minutes = if v.eq_ignore_ascii_case("off") {
+                            None
+                        } else {
+                            Some(parse_interval(v)?).filter(|m| *m > 0)
+                        };
+                        let actual = art.configure_slideshow(minutes, !sequential, &cat).await?;
+                        if actual.minutes != minutes || (minutes.is_some() && actual.shuffle == sequential) {
+                            bail!("the TV did not keep the requested slideshow interval or shuffle setting");
+                        }
                     }
                 }
             }

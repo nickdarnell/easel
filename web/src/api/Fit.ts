@@ -3,4 +3,4 @@
 /**
  * How to fit an image to the screen.
  */
-export type Fit = "auto" | "cover" | "contain" | "original";
+export type Fit = "auto" | "cover" | "contain" | "blur" | "original";

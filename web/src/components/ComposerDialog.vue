@@ -11,7 +11,6 @@ import { cap, clamp, matteParts, prettyMatte } from "../util";
 const c = composer.value!;
 const isSend = c.kind === "send";
 const title = isSend ? (c.tvs.length > 1 ? `Send to ${c.tvs.length} TVs` : `Send to ${c.tvs[0]}`) : "Reframe";
-const showNow = ref(S.showNow);
 const saving = ref(false);
 const stage = ref<HTMLElement>();
 
@@ -32,12 +31,15 @@ const place = (r: { x: number; y: number; w: number; h: number }) => ({
   height: pct(r.h),
 });
 const imgShadow = computed(() =>
-  !layout.value || layout.value.fill || layout.value.shadowbox ? "none" : "0 0 0 1px rgba(0,0,0,.12)",
+  !layout.value || layout.value.fill || layout.value.shadowbox || it.value?.mode === "blur"
+    ? "none"
+    : "0 0 0 1px rgba(0,0,0,.12)",
 );
 
 const modes: [Mode, string][] = [
   ["fill", "Fill the screen"],
   ["whole", "Show the whole photo"],
+  ["blur", "Blurred background"],
 ];
 const types = computed(() =>
   (S.mattes?.types.length ? S.mattes.types : Object.keys(MATTE_OPENING)).filter((t) => t !== "none"),
@@ -61,7 +63,7 @@ const goLabel = computed(() => {
   return `Send ${n > 1 ? n + " photos" : "photo"}`;
 });
 const badge = (i: (typeof c.items)[number]) =>
-  i.error ? "Usual" : i.mode === "fill" ? "Fill" : i.mode ? "Border" : "…";
+  i.error ? "Usual" : i.mode === "blur" ? "Blur" : i.mode === "fill" ? "Fill" : i.mode ? "Border" : "…";
 
 function setZoom(z: number) {
   const i = it.value!;
@@ -81,12 +83,13 @@ const valueOf = (e: Event) => (e.target as HTMLInputElement | HTMLSelectElement)
 function allLikeThis() {
   useForAll(c);
   const i = it.value!;
-  toast(`All ${c.items.length} photos: ${i.mode === "fill" ? "fill the screen" : prettyMatte(i.matte)}`);
+  toast(
+    `All ${c.items.length} photos: ${i.mode === "blur" ? "blurred background" : i.mode === "fill" ? "fill the screen" : prettyMatte(i.matte)}`,
+  );
 }
 
 async function go() {
   if (isSend) {
-    S.showNow = showNow.value;
     send(c);
   } else {
     saving.value = true;
@@ -152,6 +155,7 @@ function wheel(e: WheelEvent) {
           </div>
           <template v-else>
             <div class="mat" :style="{ background: layout.fill ? 'transparent' : layout.background }"></div>
+            <img v-if="it.mode === 'blur'" class="blur-background" :src="it.url" alt="" draggable="false" />
             <img :src="it.url" alt="" draggable="false" :style="{ ...place(layout.img), boxShadow: imgShadow }" />
             <div v-if="!layout.fill && layout.shadowbox" class="shade" :style="place(layout.img)"></div>
           </template>
@@ -181,7 +185,7 @@ function wheel(e: WheelEvent) {
             </div>
             <div class="muted small">{{ fillNote }}</div>
           </template>
-          <template v-else>
+          <template v-else-if="it.mode === 'whole'">
             <div class="row">
               <span class="muted small">Border</span>
               <select :value="matteType" @change="setType(valueOf($event))">
@@ -201,6 +205,7 @@ function wheel(e: WheelEvent) {
             </div>
             <div class="muted small">Nothing is cropped; the TV adds a border around it.{{ usual }}</div>
           </template>
+          <div v-else class="muted small">Keep the whole photo sharp, with a blurred copy filling the background.</div>
         </template>
       </div>
 
@@ -224,7 +229,6 @@ function wheel(e: WheelEvent) {
 
     <template #foot="{ close }">
       <template v-if="isSend">
-        <label class="check"><input v-model="showNow" type="checkbox" /> Put it on the TV right away</label>
         <span class="grow"></span>
         <button v-if="many" @click="allLikeThis">Use this framing for all</button>
       </template>

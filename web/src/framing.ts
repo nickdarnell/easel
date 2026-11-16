@@ -32,7 +32,7 @@ export const MATTE_OPENING: Record<string, [number, number]> = {
   triptych: [0.84, 0.7],
 };
 
-export type Mode = "fill" | "whole";
+export type Mode = "fill" | "whole" | "blur";
 
 /** The part of a photo being framed. `iw`/`ih` are known once its preview loads. */
 export interface Frameable {
@@ -64,6 +64,7 @@ export function frameDefaults(it: Frameable, tv: Tv | undefined) {
   it.suggest = close ? "fill" : "whole";
   it.mode = tv?.fit === "cover" ? "fill" : tv?.fit === "contain" || tv?.fit === "original" ? "whole" : it.suggest;
   if (pref === "none" && tv?.fit !== "contain") it.mode = "fill"; // this TV prefers no borders
+  if (tv?.fit === "blur") it.mode = it.suggest = "blur";
   it.pref = pref;
   it.matte = pref === "auto" || pref === "none" ? "shadowbox_polar" : pref;
   it.zoom = 1;
@@ -100,6 +101,7 @@ export function setFromCrop(it: Frameable, crop: Crop, pa: number) {
 
 export function framingOf(it: Frameable, pa: number): Framing | null {
   if (!it.iw) return null;
+  if (it.mode === "blur") return { fit: "blur", crop: null, matte: "none" };
   if (it.mode === "fill") {
     const k = cropOf(it, pa);
     return { fit: "cover", crop: { x: r4(k.x), y: r4(k.y), w: r4(k.w), h: r4(k.h) }, matte: "none" };
@@ -114,7 +116,7 @@ export function stageLayout(it: Frameable, pa: number) {
     return { fill: true, img: { x: -k.x / k.w, y: -k.y / k.h, w: 1 / k.w, h: 1 / k.h } } as const;
   }
   const [type, color] = matteParts(it.matte);
-  const [ow, oh] = MATTE_OPENING[type] || MATTE_OPENING.modern!;
+  const [ow, oh]: [number, number] = it.mode === "blur" ? [1, 1] : MATTE_OPENING[type] || MATTE_OPENING.modern!;
   const ia = it.iw! / it.ih!;
   const oa = (pa * ow) / oh;
   const [w, h] = ia > oa ? [ow, (ow * pa) / ia] : [(oh * ia) / pa, oh];
@@ -122,7 +124,7 @@ export function stageLayout(it: Frameable, pa: number) {
     fill: false,
     img: { x: (1 - w) / 2, y: (1 - h) / 2, w, h },
     background: MATTE_COLORS[color] || MATTE_COLORS.polar!,
-    shadowbox: type === "shadowbox",
+    shadowbox: it.mode !== "blur" && type === "shadowbox",
   } as const;
 }
 

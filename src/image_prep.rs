@@ -26,6 +26,8 @@ pub enum Fit {
     Cover,
     /// Never crop; only scale down to fit within the panel.
     Contain,
+    /// Keep the whole photo over a blurred, screen-filling copy.
+    Blur,
     /// Upload untouched when the TV can take it as-is (JPEG/PNG, upright).
     Original,
 }
@@ -37,8 +39,9 @@ impl FromStr for Fit {
             "auto" => Ok(Fit::Auto),
             "cover" | "fill" | "crop" => Ok(Fit::Cover),
             "contain" | "fit" => Ok(Fit::Contain),
+            "blur" => Ok(Fit::Blur),
             "original" | "none" => Ok(Fit::Original),
-            other => Err(format!("unknown fit `{other}` (expected auto, cover, contain, original)")),
+            other => Err(format!("unknown fit `{other}` (expected auto, cover, contain, blur, original)")),
         }
     }
 }
@@ -49,6 +52,7 @@ impl std::fmt::Display for Fit {
             Fit::Auto => "auto",
             Fit::Cover => "cover",
             Fit::Contain => "contain",
+            Fit::Blur => "blur",
             Fit::Original => "original",
         })
     }
@@ -225,6 +229,9 @@ pub fn preview(bytes: &[u8], max: u32) -> Result<Vec<u8>> {
 }
 
 pub fn prepare(bytes: &[u8], opts: &PrepOptions) -> Result<Prepared> {
+    if opts.width == 0 || opts.height == 0 {
+        return Err(Error::Other("panel dimensions must be positive".into()));
+    }
     let mut exif = read_exif(bytes);
     let mut decoded: Option<DynamicImage> = None;
     let format = match image::guess_format(bytes) {
@@ -271,7 +278,8 @@ pub fn prepare(bytes: &[u8], opts: &PrepOptions) -> Result<Prepared> {
         _ => (w, h),
     };
 
-    let pass_through = crop.is_none() && tv_native && upright && (fit == Fit::Original || target == (w, h));
+    let pass_through =
+        fit != Fit::Blur && crop.is_none() && tv_native && upright && (fit == Fit::Original || target == (w, h));
     if pass_through {
         return Ok(Prepared {
             data: bytes.to_vec(),
@@ -301,6 +309,7 @@ pub fn prepare(bytes: &[u8], opts: &PrepOptions) -> Result<Prepared> {
     };
     let cropped = crop.is_some() || (fit == Fit::Cover && (w as u64 * target.1 as u64 != h as u64 * target.0 as u64));
     let img = match fit {
+        Fit::Blur => blur_background(&img, pw, ph),
         Fit::Cover if (img.width(), img.height()) != target => {
             img.resize_to_fill(target.0, target.1, FilterType::Lanczos3)
         }
@@ -318,6 +327,26 @@ pub fn prepare(bytes: &[u8], opts: &PrepOptions) -> Result<Prepared> {
         reencoded: true,
         cropped,
     })
+}
+
+fn blur_background(img: &DynamicImage, width: u32, height: u32) -> DynamicImage {
+    // Blur a small backdrop to keep processing bounded even for 4K panels.
+    let scale = (320.0 / f64::from(width.max(height))).min(1.0);
+    let bw = (f64::from(width) * scale).round().max(1.0) as u32;
+    let bh = (f64::from(height) * scale).round().max(1.0) as u32;
+    let mut background = img
+        .resize_to_fill(bw, bh, FilterType::Triangle)
+        .blur(bw.min(bh) as f32 * 0.04)
+        .resize_exact(width, height, FilterType::Triangle)
+        .to_rgba8();
+    let foreground = img.resize(width, height, FilterType::Lanczos3).to_rgba8();
+    image::imageops::overlay(
+        &mut background,
+        &foreground,
+        i64::from((width - foreground.width()) / 2),
+        i64::from((height - foreground.height()) / 2),
+    );
+    DynamicImage::ImageRgba8(background)
 }
 
 fn encode_jpeg(img: &DynamicImage, quality: u8) -> Result<Vec<u8>> {
@@ -501,6 +530,42 @@ mod tests {
         let p = prepare(&src, &PrepOptions { fit: Fit::Original, ..small_panel() }).unwrap();
         assert_eq!(p.file_type, "png");
         assert!(!p.reencoded);
+    }
+
+    #[test]
+    fn blur_fills_panel_without_cropping_foreground() {
+        for (w, h) in [(40, 80), (160, 30), (160, 90)] {
+            let mut img = image::RgbImage::from_pixel(w, h, Rgb([200, 30, 20]));
+            // Distinct top and bottom edges must survive in the sharp foreground.
+            for y in 0..h {
+                for x in 0..w {
+                    if y < h / 4 {
+                        img.put_pixel(x, y, Rgb([20, 220, 20]));
+                    }
+                    if y >= h * 3 / 4 {
+                        img.put_pixel(x, y, Rgb([20, 20, 220]));
+                    }
+                }
+            }
+            let source = DynamicImage::ImageRgb8(img);
+            let src = encode_jpeg(&source, 100).unwrap();
+            let p = prepare(&src, &PrepOptions { fit: Fit::Blur, ..small_panel() }).unwrap();
+            assert_eq!((p.width, p.height), (160, 90));
+            assert!(p.reencoded && !p.cropped && p.fills(160, 90));
+            let out = image::load_from_memory(&p.data).unwrap().to_rgb8();
+            let fg = source.resize(160, 90, FilterType::Lanczos3);
+            let top = (90 - fg.height()) / 2;
+            assert!(out.get_pixel(80, top + fg.height() / 8)[1] > 180);
+            assert!(out.get_pixel(80, top + fg.height() * 7 / 8)[2] > 180);
+            assert!(out.get_pixel(0, 45).0.iter().any(|v| *v > 30), "background is filled");
+        }
+        assert_eq!("blur".parse::<Fit>().unwrap(), Fit::Blur);
+        assert_eq!(serde_json::to_string(&Fit::Blur).unwrap(), "\"blur\"");
+    }
+
+    #[test]
+    fn zero_panel_is_rejected() {
+        assert!(prepare(&jpeg(10, 10), &PrepOptions { width: 0, ..small_panel() }).is_err());
     }
 
     #[test]
