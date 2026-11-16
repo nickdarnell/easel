@@ -50,8 +50,7 @@ web page and saved in `/config`:
    `http://<server-ip>:3273/tv/Living%20Room`. **Show this QR code on the TV** puts the code
    on the TV itself, so guests can scan it with their phone camera.
 
-The image is private while the repository is: run `docker login ghcr.io` first (a GitHub token
-with `read:packages`), or build it yourself with `docker compose up -d --build`.
+To build the image yourself instead of pulling it, run `docker compose up -d --build`.
 
 ### What's in /config
 
