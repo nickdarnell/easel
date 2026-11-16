@@ -206,7 +206,8 @@ export async function loadPhotos() {
   try {
     const p = await api<PhotoList>(tvPath(name, "/photos" + (S.filter === "favorites" ? "?category=favorites" : "")));
     if (name === S.tv) {
-      S.photos = p.photos;
+      // Still on its way from the TV: a `changed` event says when it's here.
+      S.photos = p.loading ? null : p.photos;
       S.photosOffline = p.offline ? { reason: p.offline, asOf: p.as_of } : null;
       S.photosErr = null;
     }
@@ -250,14 +251,20 @@ export function thumbsArrived(ids: string[]) {
 }
 
 // ── TV actions ───────────────────────────────────────────────────────
-/** Re-read the TV's status until `done` holds (the TV can take a few seconds to apply things). */
-async function settle(done: () => boolean, tries = 8) {
-  for (let i = 0; i < tries; i++) {
-    await loadStatus();
+/** Wait up to `seconds` for the TV's status to show `done` (it can take a few seconds to apply
+ * things). The server pushes status changes; asking now and then makes it check again. */
+async function settle(done: () => boolean, seconds = 12) {
+  const end = Date.now() + seconds * 1000;
+  let ask = 0;
+  while (Date.now() < end) {
     if (done()) return true;
-    await sleep(1200);
+    if (Date.now() >= ask) {
+      loadStatus();
+      ask = Date.now() + 2400;
+    }
+    await sleep(300);
   }
-  return false;
+  return done();
 }
 
 export async function toggleArt() {
@@ -295,7 +302,7 @@ export async function showPhoto(id: string) {
   pending.show = id;
   await act(async () => {
     await api(tvPath(S.tv!, `/photos/${enc(id)}/show`), { method: "POST" });
-    await settle(() => S.status?.current?.content_id === id, 6);
+    await settle(() => S.status?.current?.content_id === id, 8);
   });
   pending.show = null;
 }
@@ -306,7 +313,7 @@ export async function showShareCard(url: string) {
   let ok = false;
   await act(async () => {
     await api(tvPath(S.tv!, "/share-card"), { json: { url } });
-    await settle(() => !!S.status?.sharing, 3);
+    await settle(() => !!S.status?.sharing, 5);
     ok = true;
   });
   pending.share = null;
@@ -318,7 +325,7 @@ export async function endShare() {
   pending.share = "ending";
   await act(async () => {
     await api(tvPath(S.tv!, "/share-card"), { method: "DELETE" });
-    await settle(() => !S.status?.sharing, 3);
+    await settle(() => !S.status?.sharing, 5);
     toast("Back to your photos");
   });
   pending.share = null;

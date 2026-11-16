@@ -1,4 +1,6 @@
-// Live updates from the server (`/api/events`).
+// Live updates from the server (`/api/events`). The server talks to the TVs; the page only
+// talks to the server, which pushes what changes (including the TV's status) through here.
+import { watch } from "vue";
 import type { ServerEvent } from "./types";
 import { S, api, loadPhotos, loadStatus, loadTvs, thumbsArrived } from "./state";
 import type { Info } from "./types";
@@ -19,13 +21,16 @@ function handle(e: ServerEvent) {
     case "thumbs":
       if (here) thumbsArrived(e.ids);
       break;
+    case "status":
+      if (here) {
+        S.status = e.status;
+        S.statusErr = null;
+      }
+      break;
     case "uploaded":
     case "changed":
     case "sync-done":
-      if (here) {
-        soon("photos", loadPhotos);
-        soon("status", loadStatus, 900);
-      }
+      if (here) soon("photos", loadPhotos);
       if (e.type === "sync-done") {
         syncToast?.remove();
         toast(
@@ -36,7 +41,7 @@ function handle(e: ServerEvent) {
       }
       break;
     case "tv-event":
-      if (here) soon("status", loadStatus, 900);
+      // The server already acts on these, and sends `status` or `changed` if anything changed.
       break;
     case "tvs-changed":
       soon("tvs", loadTvs);
@@ -60,9 +65,34 @@ function handle(e: ServerEvent) {
   }
 }
 
-export function connectEvents() {
-  const es = new EventSource("/api/events");
-  es.onmessage = (m) => {
+let es: EventSource | null = null;
+let retry: ReturnType<typeof setTimeout> | undefined;
+let following = false;
+
+/** Listen for events. Saying which TV is on screen tells the server to keep an eye on it (and
+ * stop once nobody's looking), so it reconnects whenever another TV is chosen. */
+export function connectEvents(missed = false) {
+  if (!following) {
+    following = true;
+    watch(
+      () => S.tv,
+      () => connectEvents(),
+    );
+  }
+  clearTimeout(retry);
+  es?.close();
+  const me = new EventSource("/api/events" + (S.tv ? "?tv=" + encodeURIComponent(S.tv) : ""));
+  es = me;
+  me.onopen = () => {
+    // Catch up on whatever happened while disconnected.
+    if (missed) {
+      missed = false;
+      soon("tvs", loadTvs);
+      soon("photos", loadPhotos);
+      soon("status", loadStatus);
+    }
+  };
+  me.onmessage = (m) => {
     let e: ServerEvent;
     try {
       e = JSON.parse(m.data);
@@ -71,8 +101,8 @@ export function connectEvents() {
     }
     handle(e);
   };
-  es.onerror = () => {
-    es.close();
-    setTimeout(connectEvents, 3000);
+  me.onerror = () => {
+    me.close();
+    if (es === me) retry = setTimeout(() => connectEvents(true), 3000);
   };
 }

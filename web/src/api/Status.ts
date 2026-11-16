@@ -3,9 +3,14 @@ import type { Current } from "./Current";
 import type { Slideshow } from "./Slideshow";
 
 /**
- * `GET /api/tvs/{tv}/status`. Each part is `null` if the TV didn't answer that question.
+ * `GET /api/tvs/{tv}/status`: what the TV last reported (the server keeps it up to date and
+ * sends a `status` event when it changes). Each part is `null` if the TV didn't answer that.
  */
-export type Status = { artmode: boolean | null, current: Current | null, slideshow: Slideshow | null, 
+export type Status = { 
+/**
+ * False until the TV has answered at all.
+ */
+loaded: boolean, artmode: boolean | null, current: Current | null, slideshow: Slideshow | null, 
 /**
  * A QR code card is up on the TV (see `POST .../share-card`).
  */

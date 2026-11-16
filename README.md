@@ -129,6 +129,12 @@ folder), folder sync, and Wake. You can drag photos anywhere onto the page or pa
 The page updates live when someone else sends a photo. On a phone, "Add to Home Screen" makes
 it feel like an app.
 
+Pages never talk to a TV directly. The server does that in the background, one request at a time
+(that's all the TV handles), with commands first, then whatever a page is waiting for, then its own
+upkeep. Pages get their answers from what the server last heard and are told when that changes, so
+they load straight away even when a TV is slow. Requests from a page that was closed are dropped
+before they reach the TV. Commands, though, always finish once started.
+
 ## Command line
 
 ```text

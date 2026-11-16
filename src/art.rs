@@ -43,6 +43,10 @@ pub struct ArtMessage {
     /// Inline file bytes (only older art APIs).
     #[serde(skip)]
     pub binary: Option<Vec<u8>>,
+    /// A reply to one of this client's own requests, rather than something the TV is telling
+    /// everyone (a photo was added, the slideshow moved on, ...).
+    #[serde(skip)]
+    pub reply: bool,
 }
 
 /// An artwork entry from `get_content_list` / `get_current_artwork`.
@@ -161,6 +165,8 @@ impl Waiter {
 
 struct Router {
     waiters: StdMutex<Vec<Waiter>>,
+    /// The ids of recent requests, to tell their replies from the TV's own news.
+    sent: StdMutex<std::collections::VecDeque<String>>,
     events: broadcast::Sender<ArtMessage>,
     serial: AtomicU64,
     closed: AtomicBool,
@@ -196,7 +202,8 @@ impl Router {
         };
         let event = data.get("event").and_then(Value::as_str).unwrap_or("*").to_string();
         let request_id = str_field(&data, "request_id").or_else(|| str_field(&data, "id"));
-        let msg = ArtMessage { event, request_id, data, binary: incoming.binary };
+        let reply = request_id.as_deref().is_some_and(|id| self.sent.lock().unwrap().iter().any(|s| s == id));
+        let msg = ArtMessage { event, request_id, data, binary: incoming.binary, reply };
         tracing::debug!("art event `{}` (request {:?})", msg.event, msg.request_id);
 
         let _ = self.events.send(msg.clone());
@@ -406,6 +413,7 @@ impl ArtClient {
         let (events_tx, _) = broadcast::channel(64);
         let router = Arc::new(Router {
             waiters: StdMutex::new(Vec::new()),
+            sent: StdMutex::new(std::collections::VecDeque::new()),
             events: events_tx,
             serial: AtomicU64::new(0),
             closed: AtomicBool::new(false),
@@ -442,7 +450,8 @@ impl ArtClient {
         self.request_timeout = timeout;
     }
 
-    /// Every art event the TV sends (art mode changes, slideshow advances, replies...).
+    /// Every art message the TV sends: replies to requests (marked [`ArtMessage::reply`]) and its
+    /// own news (art mode changes, slideshow advances, photos added from the phone app, ...).
     pub fn subscribe(&self) -> broadcast::Receiver<ArtMessage> {
         self.router.events.subscribe()
     }
@@ -470,6 +479,13 @@ impl ArtClient {
         obj.insert("request_id".into(), json!(id));
         let name = obj.get("request").and_then(Value::as_str).unwrap_or("?").to_string();
 
+        {
+            let mut sent = self.router.sent.lock().unwrap();
+            if sent.len() >= 256 {
+                sent.pop_front();
+            }
+            sent.push_back(id.clone());
+        }
         let pending = self.router.register(Some(id), wait_event.map(str::to_owned))?;
         let envelope = protocol::art_request_envelope(&request);
         tracing::trace!(target: "samsung_frame::wire", "-> {envelope}");
@@ -537,7 +553,7 @@ impl ArtClient {
     /// List artwork. `category`: e.g. [`protocol::category::MY_PHOTOS`]; `None` for everything.
     pub async fn content_list(&self, category: Option<&str>) -> Result<Vec<ArtItem>> {
         let msg = self
-            .request_with(json!({"request": "get_content_list", "category": category}), None, Duration::from_secs(20))
+            .request_with(json!({"request": "get_content_list", "category": category}), None, Duration::from_secs(45))
             .await?;
         let list = json_field(&msg.data, "content_list").unwrap_or(Value::Array(vec![]));
         let items: Vec<ArtItem> = serde_json::from_value(list)?;
@@ -1024,6 +1040,7 @@ mod tests {
             request_id: Some("x".into()),
             data: json!({"event": "error", "error_code": "-9", "request_data": "{\"request\":\"get_slideshow_status\"}"}),
             binary: None,
+            reply: true,
         };
         let err = check_error(msg, "fallback").unwrap_err();
         assert!(err.is_unsupported());

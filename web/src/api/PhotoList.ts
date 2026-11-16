@@ -12,4 +12,8 @@ as_of: number,
 /**
  * Why the TV couldn't be reached, when it couldn't (so this is the last list it sent).
  */
-offline: string | null, };
+offline: string | null, 
+/**
+ * The TV hasn't sent a list yet; one is on its way (announced by a `changed` event).
+ */
+loading: boolean, };

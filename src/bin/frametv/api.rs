@@ -59,7 +59,7 @@ pub struct Settings {
     pub in_docker: bool,
 }
 
-#[derive(Clone, Copy, Serialize, TS)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, TS)]
 #[serde(rename_all = "lowercase")]
 #[ts(export)]
 pub enum Power {
@@ -98,10 +98,13 @@ pub struct Tv {
     pub can_wake: bool,
 }
 
-/// `GET /api/tvs/{tv}/status`. Each part is `null` if the TV didn't answer that question.
-#[derive(Serialize, TS)]
+/// `GET /api/tvs/{tv}/status`: what the TV last reported (the server keeps it up to date and
+/// sends a `status` event when it changes). Each part is `null` if the TV didn't answer that.
+#[derive(Clone, Default, PartialEq, Serialize, TS)]
 #[ts(export)]
 pub struct Status {
+    /// False until the TV has answered at all.
+    pub loaded: bool,
     pub artmode: Option<bool>,
     pub current: Option<Current>,
     pub slideshow: Option<Slideshow>,
@@ -109,13 +112,13 @@ pub struct Status {
     pub sharing: bool,
 }
 
-#[derive(Serialize, TS)]
+#[derive(Clone, PartialEq, Serialize, TS)]
 #[ts(export)]
 pub struct Current {
     pub content_id: String,
 }
 
-#[derive(Serialize, TS)]
+#[derive(Clone, PartialEq, Serialize, TS)]
 #[ts(export)]
 pub struct Slideshow {
     /// Minutes between photos, or `null` when it's off.
@@ -158,6 +161,8 @@ pub struct PhotoList {
     pub as_of: u64,
     /// Why the TV couldn't be reached, when it couldn't (so this is the last list it sent).
     pub offline: Option<String>,
+    /// The TV hasn't sent a list yet; one is on its way (announced by a `changed` event).
+    pub loading: bool,
 }
 
 /// `POST /api/discover` (admin): a TV found on the network.
@@ -227,6 +232,11 @@ pub struct ShareCard {
 #[serde(tag = "type", rename_all = "kebab-case")]
 #[ts(export)]
 pub enum ServerEvent {
+    /// The TV's status changed.
+    Status {
+        tv: String,
+        status: Status,
+    },
     /// Thumbnails that are now cached.
     Thumbs {
         tv: String,

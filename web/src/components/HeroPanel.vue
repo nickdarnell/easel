@@ -161,7 +161,7 @@ const stop = () => setSlideshow({ ...slideshow.value, minutes: 0 });
         <button class="ghost" @click="recheck">Check again</button>
       </div>
 
-      <div v-if="isAdmin && on && S.status" class="slideshow" :class="{ busy: pending.slideshow }">
+      <div v-if="isAdmin && on && S.status?.loaded" class="slideshow" :class="{ busy: pending.slideshow }">
         <div class="ss-head">
           <div class="grow">
             <div class="ss-title">Slideshow</div>

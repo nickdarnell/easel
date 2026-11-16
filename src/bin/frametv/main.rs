@@ -18,6 +18,7 @@ use samsung_frame::{discovery, pairing, remote, rest, wol};
 
 mod api;
 mod cache;
+mod queue;
 mod serve;
 
 #[derive(Parser)]
