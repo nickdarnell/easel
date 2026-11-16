@@ -3,7 +3,7 @@ import { computed, ref } from "vue";
 import ModalDialog from "./ModalDialog.vue";
 import MatteSelect from "./MatteSelect.vue";
 import { openReframe } from "../composer";
-import { S, act, api, closeDialog, isAdmin, loadStatus, thumbUrl, tvPath } from "../state";
+import { S, act, api, closeDialog, isAdmin, pending, showPhoto, thumbUrl, tvPath } from "../state";
 import { toast } from "../toasts";
 import type { Deleted, MatteUpdate, Toggle } from "../types";
 import { enc, prettyDate, prettyMatte } from "../util";
@@ -16,13 +16,9 @@ const armed = ref(false);
 const path = (rest = "") => tvPath(S.tv!, `/photos/${enc(props.id)}${rest}`);
 const fav = S.filter === "favorites";
 
-const show = () =>
-  act(async () => {
-    await api(path("/show"), { method: "POST" });
-    closeDialog();
-    toast("Showing it now");
-    setTimeout(loadStatus, 800);
-  });
+const broken = ref(false);
+const shown = computed(() => S.status?.current?.content_id === props.id);
+const show = () => showPhoto(props.id);
 const applyMatte = () =>
   act(async () => {
     const m = matte.value;
@@ -53,7 +49,10 @@ function remove() {
 <template>
   <ModalDialog v-if="photo" :title="photo.source || 'Photo'" wide>
     <div class="detail">
-      <div class="pic"><img :src="thumbUrl(S.tv!, photo.id)" alt="" /></div>
+      <div class="pic">
+        <span v-if="broken" class="muted small">The TV has no preview of this photo.</span>
+        <img v-else :src="thumbUrl(S.tv!, photo.id)" alt="" @error="broken = true" />
+      </div>
       <div class="stack">
         <dl class="kv">
           <template v-if="photo.date"
@@ -82,7 +81,10 @@ function remove() {
         </dl>
         <template v-if="isAdmin">
           <div class="row">
-            <button class="primary grow" @click="show">Show on the TV</button>
+            <button class="primary grow" :disabled="!!pending.show || shown" @click="show">
+              <template v-if="pending.show === photo.id"><span class="spinner sm"></span>Putting it on…</template>
+              <template v-else>{{ shown ? "On the TV now" : "Show on the TV" }}</template>
+            </button>
             <button v-if="photo.reframe" @click="openReframe(photo)">Reframe…</button>
           </div>
           <div class="stack">

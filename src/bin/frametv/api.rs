@@ -84,6 +84,8 @@ pub struct Tv {
     pub name: String,
     pub host: String,
     pub model: Option<String>,
+    /// Screen size in inches (from the model number).
+    pub size_inches: Option<u32>,
     /// Panel size in pixels, landscape.
     pub resolution: (u32, u32),
     /// Folder on the server that this TV syncs from and saves received photos in.
@@ -103,6 +105,8 @@ pub struct Status {
     pub artmode: Option<bool>,
     pub current: Option<Current>,
     pub slideshow: Option<Slideshow>,
+    /// A QR code card is up on the TV (see `POST .../share-card`).
+    pub sharing: bool,
 }
 
 #[derive(Serialize, TS)]
@@ -117,6 +121,8 @@ pub struct Slideshow {
     /// Minutes between photos, or `null` when it's off.
     pub minutes: Option<u32>,
     pub shuffle: bool,
+    /// Playing only the favorites, not all of My Photos.
+    pub favorites: bool,
 }
 
 /// `GET /api/tvs/{tv}/photos`: one photo on the TV, newest first.
@@ -140,6 +146,18 @@ pub struct Photo {
     pub reframe: bool,
     /// Whether the thumbnail is cached. Others arrive later, announced by a `thumbs` event.
     pub thumb: bool,
+}
+
+/// `GET /api/tvs/{tv}/photos`: the photos, and how current the list is.
+#[derive(Serialize, TS)]
+#[ts(export)]
+pub struct PhotoList {
+    pub photos: Vec<Photo>,
+    /// When the TV sent this list, in Unix milliseconds.
+    #[ts(type = "number")]
+    pub as_of: u64,
+    /// Why the TV couldn't be reached, when it couldn't (so this is the last list it sent).
+    pub offline: Option<String>,
 }
 
 /// `POST /api/discover` (admin): a TV found on the network.
@@ -194,7 +212,8 @@ pub struct Deleted {
     pub moved_source_to: Option<String>,
 }
 
-/// `POST /api/tvs/{tv}/share-card` (admin): the QR code image now on the TV.
+/// `POST /api/tvs/{tv}/share-card` (admin): the QR code image now on the TV. `DELETE` the same
+/// path to take it down and go back to the photos.
 #[derive(Serialize, TS)]
 #[ts(export)]
 pub struct ShareCard {
@@ -317,6 +336,15 @@ pub struct SlideshowUpdate {
     pub minutes: Option<u32>,
     /// Defaults to true.
     pub shuffle: Option<bool>,
+    /// Play only the favorites instead of all of My Photos.
+    pub favorites: Option<bool>,
+}
+
+/// `POST /api/tvs/{tv}/photos/delete` (admin): the photos to act on.
+#[derive(Deserialize, TS)]
+#[ts(export)]
+pub struct PhotoIds {
+    pub ids: Vec<String>,
 }
 
 /// `POST /api/tvs/{tv}/sync` (admin): sync the TV with its folder. Progress arrives as events.

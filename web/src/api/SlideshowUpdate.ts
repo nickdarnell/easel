@@ -11,4 +11,8 @@ minutes?: number,
 /**
  * Defaults to true.
  */
-shuffle?: boolean, };
+shuffle?: boolean, 
+/**
+ * Play only the favorites instead of all of My Photos.
+ */
+favorites?: boolean, };

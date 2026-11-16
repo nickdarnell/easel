@@ -7,12 +7,12 @@
 //!
 //! All settings live in the config file, so a container needs nothing but a volume for it.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow};
 use axum::body::Bytes;
@@ -23,22 +23,32 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::Stream;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, broadcast, mpsc};
 
-use samsung_frame::art::{ArtClient, MatteList, UploadOptions};
+use samsung_frame::art::{ArtClient, ArtItem, MatteList, UploadOptions};
 use samsung_frame::config::{Config, TvConfig};
 use samsung_frame::protocol::category;
 use samsung_frame::sync::{self, Framing, TvState};
 use samsung_frame::{discovery, image_prep, localsend, pairing, rest, wol};
 
 use crate::api::{self, ServerEvent};
+use crate::cache::{self, Snapshot};
 
 // The web UI (`web/`), embedded by build.rs.
 include!(concat!(env!("OUT_DIR"), "/web_files.rs"));
 const MAX_UPLOAD: usize = 512 * 1024 * 1024;
+/// A photo list this recent is served without asking the TV again.
+const PHOTOS_FRESH: Duration = Duration::from_secs(10);
+/// After failing to connect to a TV, requests fail straight away for this long instead of
+/// each waiting for the TV again (waking it clears this).
+const RETRY_CONNECT_AFTER: Duration = Duration::from_secs(10);
+/// After the TV fails to send a photo's thumbnail, it isn't asked for that one again for this long.
+const RETRY_THUMB_AFTER: Duration = Duration::from_secs(10 * 60);
+/// A QR code card left on the TV is taken down after this long.
+const SHARE_CARD_FOR: Duration = Duration::from_secs(30 * 60);
 
 pub struct ServeOptions {
     pub bind: IpAddr,
@@ -52,16 +62,63 @@ struct Tv {
     art: Mutex<Option<Arc<ArtClient>>>,
     /// Serializes socket transfers (uploads, thumbnails) to this TV.
     xfer: Mutex<()>,
+    /// When connecting last failed, and why; cleared once a connection works.
+    down: StdMutex<Option<(Instant, String)>>,
+    /// The photo lists the TV last sent, by category (loaded from disk on first use).
+    photos: StdMutex<HashMap<&'static str, Snapshot<Vec<ArtItem>>>>,
+    /// Categories whose list is being refreshed in the background.
+    refreshing: StdMutex<HashSet<&'static str>>,
+    /// Photos the TV recently sent no thumbnail for, and when it last failed.
+    no_thumb: StdMutex<HashMap<String, Instant>>,
 }
 
 impl Tv {
     fn new(cfg: TvConfig) -> Arc<Self> {
-        Arc::new(Tv { name: cfg.name.clone(), cfg: StdMutex::new(cfg), art: Mutex::new(None), xfer: Mutex::new(()) })
+        Arc::new(Tv {
+            name: cfg.name.clone(),
+            cfg: StdMutex::new(cfg),
+            art: Mutex::new(None),
+            xfer: Mutex::new(()),
+            down: StdMutex::new(None),
+            photos: StdMutex::new(HashMap::new()),
+            refreshing: StdMutex::new(HashSet::new()),
+            no_thumb: StdMutex::new(HashMap::new()),
+        })
     }
 
     fn config(&self) -> TvConfig {
         self.cfg.lock().unwrap().clone()
     }
+
+    /// Why the TV isn't reachable, if connecting to it failed recently.
+    fn down_reason(&self) -> Option<String> {
+        let down = self.down.lock().unwrap();
+        down.as_ref().filter(|(at, _)| at.elapsed() < RETRY_CONNECT_AFTER).map(|(_, why)| why.clone())
+    }
+
+    /// The cached photo lists no longer match the TV: the next listing asks it.
+    fn photos_changed(&self) {
+        for snap in self.photos.lock().unwrap().values_mut() {
+            snap.stale = true;
+        }
+    }
+}
+
+/// A QR code card on the TV, and what to put back when sharing is done.
+#[derive(Clone, Serialize, Deserialize)]
+struct ShareSession {
+    content_id: String,
+    /// What the TV was showing before.
+    previous: Option<String>,
+    /// The slideshow that was running before (paused so it doesn't turn away from the card).
+    slideshow: Option<PausedSlideshow>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PausedSlideshow {
+    minutes: u32,
+    shuffle: bool,
+    category: String,
 }
 
 struct Hub {
@@ -142,6 +199,11 @@ fn is_disconnect(e: &samsung_frame::Error) -> bool {
     matches!(e, samsung_frame::Error::Disconnected | samsung_frame::Error::WebSocket(_))
 }
 
+/// A connection that stops answering (the TV dozed off, Wi-Fi dropped) often still looks open.
+fn is_unanswered(e: &samsung_frame::Error) -> bool {
+    is_disconnect(e) || matches!(e, samsung_frame::Error::Timeout(..))
+}
+
 impl Hub {
     fn tv(&self, name: &str) -> ApiResult<Arc<Tv>> {
         self.tvs
@@ -159,6 +221,12 @@ impl Hub {
 
     fn emit(&self, event: ServerEvent) {
         let _ = self.events.send(event);
+    }
+
+    /// The TV's photos changed: forget the cached lists and tell the pages.
+    fn changed(&self, tv: &Tv) {
+        tv.photos_changed();
+        self.emit(ServerEvent::Changed { tv: tv.name.clone() });
     }
 
     fn server_settings(&self) -> samsung_frame::config::ServerSettings {
@@ -198,6 +266,64 @@ impl Hub {
         sync::state_path(&self.data_dir.join("thumbs"), &tv.name).with_extension("")
     }
 
+    fn cache_file(&self, tv: &Tv, what: &str) -> PathBuf {
+        sync::state_path(&self.data_dir.join("cache"), &tv.name).with_extension("").join(format!("{what}.json"))
+    }
+
+    /// The QR code card that's up on the TV, if there is one (kept on disk, so it can still be
+    /// taken down after a restart).
+    fn share_session(&self, tv: &Tv) -> Option<ShareSession> {
+        cache::load(&self.cache_file(tv, "share-card")).map(|s| s.value)
+    }
+
+    fn set_share_session(&self, tv: &Tv, session: Option<&ShareSession>) {
+        let file = self.cache_file(tv, "share-card");
+        match session {
+            Some(s) => cache::save(&file, &Snapshot::now(s.clone())),
+            None => {
+                let _ = std::fs::remove_file(file);
+            }
+        }
+    }
+
+    /// Take the QR code card down: resume the slideshow, put back what was showing (unless
+    /// someone has since chosen something else), and delete the card. `false` if there was none.
+    async fn end_share(self: &Arc<Self>, tv: &Arc<Tv>) -> anyhow::Result<bool> {
+        let Some(session) = self.share_session(tv) else {
+            return Ok(false);
+        };
+        let card = session.content_id.clone();
+        let showing = self.read_art(tv, |a| async move { a.current_artwork().await }).await?.content_id;
+        if let Some(ss) = &session.slideshow {
+            let ss = ss.clone();
+            self.with_art(tv, |a| {
+                let ss = ss.clone();
+                async move { a.set_slideshow(Some(ss.minutes), ss.shuffle, &ss.category).await }
+            })
+            .await?;
+        }
+        if showing == card {
+            let back = session.previous.filter(|p| *p != card);
+            if let Some(id) = back {
+                let shown = self
+                    .with_art(tv, |a| {
+                        let id = id.clone();
+                        async move { a.select_image(&id, None, true).await }
+                    })
+                    .await;
+                if let Err(e) = shown {
+                    tracing::warn!("{}: putting {id} back after sharing: {e:#}", tv.name);
+                }
+            }
+        }
+        if let Err(e) = self.delete_from_tv(tv, vec![card.clone()]).await {
+            tracing::warn!("{}: deleting the QR code card {card}: {e:#}", tv.name);
+        }
+        self.set_share_session(tv, None);
+        self.changed(tv);
+        Ok(true)
+    }
+
     /// The art connection, reconnecting if the TV dropped it.
     async fn art(self: &Arc<Self>, tv: &Arc<Tv>) -> anyhow::Result<Arc<ArtClient>> {
         let mut slot = tv.art.lock().await;
@@ -206,13 +332,28 @@ impl Hub {
         {
             return Ok(Arc::clone(a));
         }
+        // It just failed: don't make every request wait for it again.
+        if let Some(why) = tv.down_reason() {
+            return Err(anyhow!(why));
+        }
         let cfg = tv.config();
         let client_name = self.cfg.lock().unwrap().client_name.clone();
         let endpoint = cfg.endpoint(&client_name);
-        let art = tokio::time::timeout(Duration::from_secs(15), ArtClient::connect(&endpoint))
-            .await
-            .map_err(|_| anyhow!("{} did not answer (is it on?)", tv.name))?
-            .with_context(|| format!("connecting to {}", tv.name))?;
+        let connected = match tokio::time::timeout(Duration::from_secs(15), ArtClient::connect(&endpoint)).await {
+            Ok(Ok(art)) => Ok(art),
+            Ok(Err(e)) => Err(anyhow::Error::new(e).context(format!("connecting to {}", tv.name))),
+            Err(_) => Err(anyhow!("{} did not answer (is it on?)", tv.name)),
+        };
+        let art = match connected {
+            Ok(art) => {
+                tv.down.lock().unwrap().take();
+                art
+            }
+            Err(e) => {
+                *tv.down.lock().unwrap() = Some((Instant::now(), format!("{e:#}")));
+                return Err(e);
+            }
+        };
         if let Some(token) = art.issued_token()
             && cfg.token.as_deref() != Some(token)
         {
@@ -232,7 +373,15 @@ impl Hub {
         tokio::spawn(async move {
             loop {
                 match rx.recv().await {
-                    Ok(m) => hub.emit(ServerEvent::TvEvent { tv: name.clone(), event: m.event, data: m.data }),
+                    Ok(m) => {
+                        // Photos added, removed or changed by anyone, including the phone app.
+                        let ev = m.event.as_str();
+                        let photos = ["added", "deleted", "favorite", "matte"].iter().any(|w| ev.contains(w));
+                        if photos && let Ok(tv) = hub.tv(&name) {
+                            hub.changed(&tv);
+                        }
+                        hub.emit(ServerEvent::TvEvent { tv: name.clone(), event: m.event, data: m.data });
+                    }
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(_) => break,
                 }
@@ -257,6 +406,92 @@ impl Hub {
             }
             other => Ok(other?),
         }
+    }
+
+    /// Like [`Self::with_art`], but also retries when the TV doesn't answer at all, which is
+    /// only safe for requests that change nothing.
+    async fn read_art<T, F, Fut>(self: &Arc<Self>, tv: &Arc<Tv>, f: F) -> anyhow::Result<T>
+    where
+        F: Fn(Arc<ArtClient>) -> Fut,
+        Fut: Future<Output = samsung_frame::Result<T>>,
+    {
+        let art = self.art(tv).await?;
+        match f(art).await {
+            Err(e) if is_unanswered(&e) => {
+                tracing::info!("{}: {e}; retrying on a new connection", tv.name);
+                tv.art.lock().await.take();
+                let art = self.art(tv).await?;
+                Ok(f(art).await?)
+            }
+            other => Ok(other?),
+        }
+    }
+
+    /// The TV's photos in `cat`: from the cache if it's recent, otherwise from the TV, falling
+    /// back to the cache when the TV doesn't answer. Also returns, if the TV couldn't be
+    /// reached, why.
+    async fn photo_list(
+        self: &Arc<Self>,
+        tv: &Arc<Tv>,
+        cat: &'static str,
+    ) -> anyhow::Result<(Snapshot<Vec<ArtItem>>, Option<String>)> {
+        let cached = {
+            let mut lists = tv.photos.lock().unwrap();
+            if !lists.contains_key(cat)
+                && let Some(snap) = cache::load(&self.cache_file(tv, &format!("photos-{cat}")))
+            {
+                lists.insert(cat, snap);
+            }
+            lists.get(cat).cloned()
+        };
+        // Nothing known to have changed: answer now, and check with the TV in the background.
+        if let Some(snap) = cached.clone().filter(|s| !s.stale) {
+            if !snap.is_fresh(PHOTOS_FRESH) {
+                self.refresh_photos(tv, cat);
+            }
+            return Ok((snap, tv.down_reason()));
+        }
+        match self.fetch_photos(tv, cat).await {
+            Ok(snap) => Ok((snap, None)),
+            Err(e) => match cached {
+                Some(snap) => Ok((snap, Some(format!("{e:#}")))),
+                None => Err(e),
+            },
+        }
+    }
+
+    /// Ask the TV for its photos in `cat`, and cache them.
+    async fn fetch_photos(self: &Arc<Self>, tv: &Arc<Tv>, cat: &'static str) -> anyhow::Result<Snapshot<Vec<ArtItem>>> {
+        let items = self.read_art(tv, |a| async move { a.content_list(Some(cat)).await }).await?;
+        let snap = Snapshot::now(items);
+        cache::save(&self.cache_file(tv, &format!("photos-{cat}")), &snap);
+        tv.photos.lock().unwrap().insert(cat, snap.clone());
+        Ok(snap)
+    }
+
+    /// Update the cached list in the background. Tells the pages if it changed, or if the TV
+    /// just stopped answering.
+    fn refresh_photos(self: &Arc<Self>, tv: &Arc<Tv>, cat: &'static str) {
+        if !tv.refreshing.lock().unwrap().insert(cat) {
+            return;
+        }
+        let (hub, tv) = (Arc::clone(self), Arc::clone(tv));
+        tokio::spawn(async move {
+            let json = |s: &Snapshot<Vec<ArtItem>>| serde_json::to_string(&s.value).unwrap_or_default();
+            let before = tv.photos.lock().unwrap().get(cat).map(json);
+            let was_down = tv.down_reason().is_some();
+            match hub.fetch_photos(&tv, cat).await {
+                Ok(snap) if before.as_deref() != Some(json(&snap).as_str()) => hub.changed(&tv),
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::info!("refreshing {}'s photos: {e:#}", tv.name);
+                    if !was_down {
+                        hub.emit(ServerEvent::Changed { tv: tv.name.clone() });
+                    }
+                }
+            }
+            tv.refreshing.lock().unwrap().remove(cat);
+        });
     }
 
     /// Prepare and upload a file, retrying once on a fresh connection.
@@ -310,13 +545,15 @@ impl Hub {
         let _guard = tv.xfer.lock().await;
         let state_file = self.state_file(tv);
         let mut state = TvState::load(&state_file)?;
-        let on_tv: HashSet<String> = self
-            .with_art(tv, |a| async move { a.content_list(Some(category::MY_PHOTOS)).await })
-            .await?
-            .into_iter()
-            .map(|i| i.content_id)
-            .collect();
-        let existing = state.content_for_hash(&hash).filter(|id| on_tv.contains(*id)).map(str::to_owned);
+        // Only ask the TV for its photos if this exact file was sent before.
+        let existing = match state.content_for_hash(&hash).map(str::to_owned) {
+            Some(id) => {
+                let on_tv =
+                    self.read_art(tv, |a| async move { a.content_list(Some(category::MY_PHOTOS)).await }).await?;
+                on_tv.iter().any(|i| i.content_id == id).then_some(id)
+            }
+            None => None,
+        };
         // Same photo, and either no explicit framing asked for or the same one as before.
         let same = existing.as_ref().filter(|id| {
             framing.is_none() || state.uploads.get(*id).and_then(|r| r.framing.as_ref()) == framing.as_ref()
@@ -350,6 +587,7 @@ impl Hub {
             .await?;
         }
         let photo = api::Uploaded { content_id, name: file_name.to_owned(), duplicate, shown: show };
+        tv.photos_changed();
         self.emit(ServerEvent::Uploaded { tv: tv.name.clone(), photo: photo.clone() });
         Ok(photo)
     }
@@ -437,13 +675,14 @@ pub async fn run(cfg: Config, cfg_path: PathBuf, state_dir: PathBuf, opts: Serve
         .route("/api/tvs/{tv}/photos/{id}/favorite", post(favorite))
         .route("/api/tvs/{tv}/photos/{id}/original", get(original))
         .route("/api/tvs/{tv}/photos/{id}/reframe", post(reframe))
+        .route("/api/tvs/{tv}/photos/delete", post(delete_many))
         .route("/api/tvs/{tv}/photos/{id}", axum::routing::delete(delete_photo))
         .route("/api/tvs/{tv}/mattes", get(mattes))
         .route("/api/tvs/{tv}/artmode", post(artmode))
         .route("/api/tvs/{tv}/slideshow", post(slideshow))
         .route("/api/tvs/{tv}/sync", post(sync_folder))
         .route("/api/tvs/{tv}/wake", post(wake))
-        .route("/api/tvs/{tv}/share-card", post(share_card))
+        .route("/api/tvs/{tv}/share-card", post(share_card).delete(end_share))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD))
         .with_state(Arc::clone(&hub));
 
@@ -743,6 +982,7 @@ async fn list_tvs(State(hub): State<Shared>) -> Json<Vec<api::Tv>> {
         };
         api::Tv {
             resolution: cfg.panel_size(),
+            size_inches: cfg.size_inches(),
             folder: cfg.folder.as_ref().map(|f| f.display().to_string()),
             fit: cfg.fit.as_deref().and_then(|f| f.parse().ok()),
             can_wake: cfg.mac.is_some(),
@@ -871,7 +1111,12 @@ async fn tv_status(State(hub): State<Shared>, UrlPath(name): UrlPath<String>) ->
     Ok(Json(api::Status {
         artmode: artmode.ok(),
         current: current.ok().map(|c| api::Current { content_id: c.content_id }),
-        slideshow: slideshow.ok().map(|s| api::Slideshow { minutes: s.minutes, shuffle: s.shuffle }),
+        slideshow: slideshow.ok().map(|s| api::Slideshow {
+            minutes: s.minutes,
+            shuffle: s.shuffle,
+            favorites: s.category_id.as_deref() == Some(category::FAVORITES),
+        }),
+        sharing: hub.share_session(&tv).is_some(),
     }))
 }
 
@@ -884,13 +1129,18 @@ async fn photos(
     State(hub): State<Shared>,
     UrlPath(name): UrlPath<String>,
     Query(q): Query<PhotosQuery>,
-) -> ApiResult<Json<Vec<api::Photo>>> {
+) -> ApiResult<Json<api::PhotoList>> {
     let tv = hub.tv(&name)?;
     let cat = match q.category.as_deref() {
         Some("favorites") => category::FAVORITES,
         _ => category::MY_PHOTOS,
     };
-    let mut items = hub.with_art(&tv, |a| async move { a.content_list(Some(cat)).await }).await?;
+    let (snap, offline) = hub.photo_list(&tv, cat).await?;
+    let mut items = snap.value;
+    // The QR code card is only there while sharing; it isn't one of the photos.
+    if let Some(card) = hub.share_session(&tv) {
+        items.retain(|i| i.content_id != card.content_id);
+    }
     // Newest first, like a camera roll.
     items.sort_by(|a, b| b.image_date.cmp(&a.image_date).then_with(|| b.content_id.cmp(&a.content_id)));
     let state = TvState::load(&hub.state_file(&tv)).unwrap_or_default();
@@ -920,19 +1170,22 @@ async fn photos(
     // Warm the thumbnail cache in the background so the grid fills in quickly.
     let missing: Vec<String> =
         items.iter().map(|i| i.content_id.clone()).filter(|id| find_thumb(&dir, id).is_none()).collect();
-    if !missing.is_empty() {
+    if !missing.is_empty() && offline.is_none() {
         let (hub, tv) = (Arc::clone(&hub), Arc::clone(&tv));
         tokio::spawn(async move {
             for chunk in missing.chunks(12) {
-                if let Err(e) = fetch_thumbs(&hub, &tv, chunk).await {
-                    tracing::warn!("thumbnail prefetch for {}: {e:#}", tv.name);
-                    break;
+                match fetch_thumbs(&hub, &tv, chunk).await {
+                    Ok(ids) if ids.is_empty() => {}
+                    Ok(ids) => hub.emit(ServerEvent::Thumbs { tv: tv.name.clone(), ids }),
+                    Err(e) => {
+                        tracing::warn!("thumbnail prefetch for {}: {e:#}", tv.name);
+                        break;
+                    }
                 }
-                hub.emit(ServerEvent::Thumbs { tv: tv.name.clone(), ids: chunk.to_vec() });
             }
         });
     }
-    Ok(Json(out))
+    Ok(Json(api::PhotoList { photos: out, as_of: snap.at, offline }))
 }
 
 fn safe_id(id: &str) -> String {
@@ -941,28 +1194,148 @@ fn safe_id(id: &str) -> String {
 
 fn find_thumb(dir: &Path, id: &str) -> Option<PathBuf> {
     let base = safe_id(id);
-    ["jpg", "png"].iter().map(|e| dir.join(format!("{base}.{e}"))).find(|p| p.exists())
+    // An empty file is a failed write, not a thumbnail.
+    ["jpg", "png"].iter().map(|e| dir.join(format!("{base}.{e}"))).find(|p| p.metadata().is_ok_and(|m| m.len() > 0))
 }
 
-async fn fetch_thumbs(hub: &Shared, tv: &Arc<Tv>, ids: &[String]) -> anyhow::Result<()> {
+/// The thumbnail as a file the browser can show, with its extension: as sent if it's a JPEG or
+/// PNG, converted if it's some other image, `None` if it isn't one.
+fn browser_image(data: Vec<u8>) -> Option<(Vec<u8>, &'static str)> {
+    match image::guess_format(&data).ok()? {
+        image::ImageFormat::Jpeg => Some((data, "jpg")),
+        image::ImageFormat::Png => Some((data, "png")),
+        _ => image_prep::preview(&data, 1024).ok().map(|jpeg| (jpeg, "jpg")),
+    }
+}
+
+/// Fetch and cache thumbnails, returning the ids that are now cached. The TV sometimes skips a
+/// photo in a batch, so those are asked for one by one, and if the TV still sends nothing, a
+/// photo sent from here gets a thumbnail made from its original. Photos that end up without
+/// one aren't asked for again for a while.
+async fn fetch_thumbs(hub: &Shared, tv: &Arc<Tv>, ids: &[String]) -> anyhow::Result<Vec<String>> {
     let dir = hub.thumb_dir(tv);
     let _guard = tv.xfer.lock().await;
-    let ids: Vec<String> = ids.iter().filter(|id| find_thumb(&dir, id).is_none()).cloned().collect();
-    if ids.is_empty() {
-        return Ok(());
+    let mut cached = Vec::new();
+    let mut want: Vec<String> = Vec::new();
+    {
+        let no_thumb = tv.no_thumb.lock().unwrap();
+        for id in ids {
+            if find_thumb(&dir, id).is_some() {
+                cached.push(id.clone());
+            } else if no_thumb.get(id).is_none_or(|at| at.elapsed() >= RETRY_THUMB_AFTER) {
+                want.push(id.clone());
+            }
+        }
     }
-    let thumbs = hub
-        .with_art(tv, |a| {
-            let ids = ids.clone();
-            async move { a.thumbnails(&ids).await }
-        })
-        .await?;
+    if want.is_empty() {
+        return Ok(cached);
+    }
     std::fs::create_dir_all(&dir)?;
-    for t in thumbs {
-        let ext = if t.file_type.eq_ignore_ascii_case("png") { "png" } else { "jpg" };
-        std::fs::write(dir.join(format!("{}.{ext}", safe_id(&t.content_id))), &t.data)?;
+    let save = |id: &str, data: Vec<u8>| -> bool {
+        let Some((data, ext)) = browser_image(data) else {
+            tracing::warn!("{}: the thumbnail for {id} isn't an image", tv.name);
+            return false;
+        };
+        for old in ["jpg", "png"] {
+            let _ = std::fs::remove_file(dir.join(format!("{}.{old}", safe_id(id))));
+        }
+        match std::fs::write(dir.join(format!("{}.{ext}", safe_id(id))), data) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!("caching the thumbnail for {id}: {e}");
+                false
+            }
+        }
+    };
+    // Which photo each thumbnail is for: the TV labels them, but not always exactly as asked.
+    let assign = |label: &str, asked: &[String]| -> Option<String> {
+        let stem = label.rsplit_once('.').map_or(label, |(s, _)| s);
+        asked
+            .iter()
+            .find(|id| id.as_str() == label || id.eq_ignore_ascii_case(stem))
+            .or(if asked.len() == 1 { asked.first() } else { None })
+            .cloned()
+    };
+
+    let batch = hub
+        .with_art(tv, |a| {
+            let want = want.clone();
+            async move { a.thumbnails(&want).await }
+        })
+        .await;
+    match batch {
+        Ok(thumbs) => {
+            for t in thumbs {
+                match assign(&t.content_id, &want) {
+                    Some(id) if save(&id, t.data) => cached.push(id),
+                    Some(_) => {}
+                    None => {
+                        tracing::warn!("{}: got a thumbnail for {:?}, which wasn't asked for", tv.name, t.content_id);
+                    }
+                }
+            }
+        }
+        // Couldn't reach the TV: nothing more to try now.
+        Err(e) if tv.down_reason().is_some() || e.downcast_ref::<samsung_frame::Error>().is_some_and(is_unanswered) => {
+            return if cached.is_empty() { Err(e) } else { Ok(cached) };
+        }
+        Err(e) => tracing::warn!("{}: thumbnails for {want:?}: {e}", tv.name),
     }
-    Ok(())
+
+    let mut missing: Vec<String> = want.into_iter().filter(|id| !cached.contains(id)).collect();
+    if !missing.is_empty() {
+        for id in missing.clone() {
+            let one = hub
+                .with_art(tv, |a| {
+                    let id = id.clone();
+                    async move { a.thumbnails_one_by_one(std::slice::from_ref(&id)).await }
+                })
+                .await;
+            match one {
+                Ok(thumbs) => {
+                    if let Some(t) = thumbs.into_iter().next()
+                        && save(&id, t.data)
+                    {
+                        cached.push(id.clone());
+                    }
+                }
+                Err(e) => tracing::info!("{}: no thumbnail for {id} from the TV: {e}", tv.name),
+            }
+        }
+        missing.retain(|id| !cached.contains(id));
+    }
+
+    if !missing.is_empty() {
+        let state = TvState::load(&hub.state_file(tv)).unwrap_or_default();
+        for id in &missing {
+            let Some(source) = state.uploads.get(id).map(|r| r.source.clone()).filter(|p| p.is_file()) else {
+                continue;
+            };
+            let made = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
+                Ok(image_prep::preview(&std::fs::read(source)?, 512)?)
+            })
+            .await?;
+            match made {
+                Ok(jpeg) => {
+                    if save(id, jpeg) {
+                        cached.push(id.clone());
+                    }
+                }
+                Err(e) => tracing::warn!("{}: making a thumbnail for {id} from its original: {e:#}", tv.name),
+            }
+        }
+        missing.retain(|id| !cached.contains(id));
+    }
+
+    let mut no_thumb = tv.no_thumb.lock().unwrap();
+    for id in &cached {
+        no_thumb.remove(id);
+    }
+    for id in missing {
+        tracing::warn!("{}: no thumbnail for {id}", tv.name);
+        no_thumb.insert(id, Instant::now());
+    }
+    Ok(cached)
 }
 
 async fn thumb(State(hub): State<Shared>, UrlPath((name, id)): UrlPath<(String, String)>) -> ApiResult<Response> {
@@ -972,7 +1345,7 @@ async fn thumb(State(hub): State<Shared>, UrlPath((name, id)): UrlPath<(String, 
         fetch_thumbs(&hub, &tv, std::slice::from_ref(&id)).await?;
     }
     let path = find_thumb(&dir, &id)
-        .ok_or_else(|| status_err(StatusCode::NOT_FOUND, format!("the TV sent no thumbnail for {id}")))?;
+        .ok_or_else(|| status_err(StatusCode::NOT_FOUND, format!("the TV has no preview of {id}")))?;
     let mime = if path.extension().is_some_and(|e| e == "png") { "image/png" } else { "image/jpeg" };
     Ok((
         [(header::CONTENT_TYPE, mime), (header::CACHE_CONTROL, "private, max-age=86400")],
@@ -1054,7 +1427,7 @@ async fn set_matte(
         async move { a.change_matte(&id, &matte, portrait.as_deref()).await }
     })
     .await?;
-    hub.emit(ServerEvent::Changed { tv: tv.name.clone() });
+    hub.changed(&tv);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1071,7 +1444,7 @@ async fn favorite(
         async move { a.set_favorite(&id, b.on).await }
     })
     .await?;
-    hub.emit(ServerEvent::Changed { tv: tv.name.clone() });
+    hub.changed(&tv);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1134,7 +1507,7 @@ async fn reframe(
     if let Err(e) = hub.delete_from_tv(&tv, vec![id.clone()]).await {
         tracing::warn!("removing the old version of {id} from {}: {e:#}", tv.name);
     }
-    hub.emit(ServerEvent::Changed { tv: tv.name.clone() });
+    hub.changed(&tv);
     Ok(Json(api::Reframed { content_id: result.content_id, replaced: id, matte: result.matte }))
 }
 
@@ -1147,30 +1520,68 @@ async fn delete_photo(
 ) -> ApiResult<Json<api::Deleted>> {
     hub.require_admin(&headers)?;
     let tv = hub.tv(&name)?;
-    hub.delete_from_tv(&tv, vec![id.clone()]).await?;
-    let state_file = hub.state_file(&tv);
+    Ok(Json(delete_photos(&hub, &tv, vec![id]).await?.remove(0)))
+}
+
+/// `POST /api/tvs/{tv}/photos/delete` (admin): delete several photos at once.
+async fn delete_many(
+    State(hub): State<Shared>,
+    headers: HeaderMap,
+    UrlPath(name): UrlPath<String>,
+    Json(b): Json<api::PhotoIds>,
+) -> ApiResult<Json<Vec<api::Deleted>>> {
+    hub.require_admin(&headers)?;
+    let tv = hub.tv(&name)?;
+    if b.ids.is_empty() {
+        return Ok(Json(vec![]));
+    }
+    Ok(Json(delete_photos(&hub, &tv, b.ids).await?))
+}
+
+/// Delete photos from the TV. Originals that came from the TV's sync folder are moved aside, to
+/// `.removed`, so the next sync doesn't put them back.
+async fn delete_photos(hub: &Shared, tv: &Arc<Tv>, ids: Vec<String>) -> anyhow::Result<Vec<api::Deleted>> {
+    hub.delete_from_tv(tv, ids.clone()).await?;
+    let state_file = hub.state_file(tv);
     let mut state = TvState::load(&state_file)?;
-    let mut moved = None;
-    if let Some(rec) = state.uploads.remove(&id) {
-        if let Some(folder) = tv.config().folder
-            && rec.source.starts_with(&folder)
-            && rec.source.exists()
-            && let Some(file) = rec.source.file_name()
-        {
-            let bin = folder.join(".removed");
-            std::fs::create_dir_all(&bin)?;
-            std::fs::rename(&rec.source, bin.join(file))?;
-            moved = Some(bin.join(file));
+    let folder = tv.config().folder;
+    let mut out = Vec::new();
+    let mut changed = false;
+    for id in ids {
+        let mut moved = None;
+        if let Some(rec) = state.uploads.remove(&id) {
+            changed = true;
+            if let Some(folder) = &folder
+                && rec.source.starts_with(folder)
+                && rec.source.exists()
+                && let Some(file) = rec.source.file_name()
+            {
+                let bin = folder.join(".removed");
+                std::fs::create_dir_all(&bin)?;
+                std::fs::rename(&rec.source, bin.join(file))?;
+                moved = Some(bin.join(file));
+            }
         }
+        out.push(api::Deleted { deleted: id, moved_source_to: moved.map(|p| p.display().to_string()) });
+    }
+    if changed {
         state.save(&state_file)?;
     }
-    hub.emit(ServerEvent::Changed { tv: tv.name.clone() });
-    Ok(Json(api::Deleted { deleted: id, moved_source_to: moved.map(|p| p.display().to_string()) }))
+    hub.changed(tv);
+    Ok(out)
 }
 
 async fn mattes(State(hub): State<Shared>, UrlPath(name): UrlPath<String>) -> ApiResult<Json<MatteList>> {
     let tv = hub.tv(&name)?;
-    Ok(Json(hub.with_art(&tv, |a| async move { a.matte_list().await }).await?))
+    let file = hub.cache_file(&tv, "mattes");
+    match hub.read_art(&tv, |a| async move { a.matte_list().await }).await {
+        Ok(list) => {
+            cache::save(&file, &Snapshot::now(list.clone()));
+            Ok(Json(list))
+        }
+        // They hardly ever change, so the last list the TV sent will do.
+        Err(e) => cache::load(&file).map(|s| Json(s.value)).ok_or_else(|| e.into()),
+    }
 }
 
 async fn artmode(
@@ -1194,8 +1605,9 @@ async fn slideshow(
     hub.require_admin(&headers)?;
     let tv = hub.tv(&name)?;
     let (minutes, shuffle) = (b.minutes.filter(|m| *m > 0), b.shuffle.unwrap_or(true));
-    hub.with_art(&tv, |a| async move { a.set_slideshow(minutes, shuffle, category::MY_PHOTOS).await }).await?;
-    hub.emit(ServerEvent::Changed { tv: tv.name.clone() });
+    let cat = if b.favorites.unwrap_or(false) { category::FAVORITES } else { category::MY_PHOTOS };
+    hub.with_art(&tv, |a| async move { a.set_slideshow(minutes, shuffle, cat).await }).await?;
+    hub.changed(&tv);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1257,7 +1669,7 @@ async fn sync_folder(
         if let Err(e) = result {
             hub2.emit(ServerEvent::Error { tv: tv.name.clone(), message: format!("sync: {e:#}") });
         }
-        hub2.emit(ServerEvent::Changed { tv: tv.name.clone() });
+        hub2.changed(&tv);
     });
     Ok(StatusCode::ACCEPTED)
 }
@@ -1271,10 +1683,12 @@ async fn wake(State(hub): State<Shared>, headers: HeaderMap, UrlPath(name): UrlP
         wol::wake(&mac, Some(&cfg.host))?;
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
+    tv.down.lock().unwrap().take();
     Ok(StatusCode::ACCEPTED)
 }
 
-/// Put a "scan me" QR code on the TV that opens this TV's guest upload page.
+/// Put a "scan me" QR code on the TV that opens this TV's guest upload page. The slideshow is
+/// paused meanwhile; `DELETE` (or [`SHARE_CARD_FOR`] passing) puts things back as they were.
 async fn share_card(
     State(hub): State<Shared>,
     headers: HeaderMap,
@@ -1283,6 +1697,27 @@ async fn share_card(
 ) -> ApiResult<Json<api::ShareCard>> {
     hub.require_admin(&headers)?;
     let tv = hub.tv(&name)?;
+    let old = hub.share_session(&tv);
+    // What to put back afterwards. If a card is already up, that's whatever was there before it.
+    let (previous, slideshow) = if let Some(s) = &old {
+        (s.previous.clone(), s.slideshow.clone())
+    } else {
+        let (current, ss) = hub
+            .read_art(&tv, |a| async move {
+                let (c, s) = tokio::join!(a.current_artwork(), a.slideshow_status());
+                Ok((c.ok().map(|c| c.content_id), s.ok()))
+            })
+            .await?;
+        let ss = ss.and_then(|s| {
+            Some(PausedSlideshow {
+                minutes: s.minutes?,
+                shuffle: s.shuffle,
+                category: s.category_id.unwrap_or_else(|| category::MY_PHOTOS.to_string()),
+            })
+        });
+        (current, ss)
+    };
+
     let (w, h) = tv.config().panel_size();
     let jpeg = render_share_card(&b.url, w, h)?;
     let id = {
@@ -1294,24 +1729,63 @@ async fn share_card(
         })
         .await?
     };
+    let session = ShareSession { content_id: id.clone(), previous, slideshow };
+    hub.set_share_session(&tv, Some(&session));
+    if let Some(ss) = &session.slideshow {
+        let ss = ss.clone();
+        hub.with_art(&tv, |a| {
+            let ss = ss.clone();
+            async move { a.set_slideshow(None, ss.shuffle, &ss.category).await }
+        })
+        .await?;
+    }
     let shown = id.clone();
     hub.with_art(&tv, |a| {
         let id = shown.clone();
         async move { a.select_image(&id, None, true).await }
     })
     .await?;
-    hub.emit(ServerEvent::Changed { tv: tv.name.clone() });
+    if let Some(old) = old
+        && let Err(e) = hub.delete_from_tv(&tv, vec![old.content_id.clone()]).await
+    {
+        tracing::warn!("{}: deleting the old QR code card {}: {e:#}", tv.name, old.content_id);
+    }
+    hub.changed(&tv);
+
+    // Don't leave it up forever if nobody says they're done.
+    let (hub2, tv2, card) = (Arc::clone(&hub), Arc::clone(&tv), id.clone());
+    tokio::spawn(async move {
+        tokio::time::sleep(SHARE_CARD_FOR).await;
+        if hub2.share_session(&tv2).is_some_and(|s| s.content_id == card)
+            && let Err(e) = hub2.end_share(&tv2).await
+        {
+            tracing::warn!("{}: taking the QR code card down: {e:#}", tv2.name);
+        }
+    });
     Ok(Json(api::ShareCard { content_id: id }))
 }
 
-/// A full-screen image with a large QR code on a white card, for the TV.
+/// `DELETE /api/tvs/{tv}/share-card` (admin): done sharing; back to the photos.
+async fn end_share(
+    State(hub): State<Shared>,
+    headers: HeaderMap,
+    UrlPath(name): UrlPath<String>,
+) -> ApiResult<StatusCode> {
+    hub.require_admin(&headers)?;
+    let tv = hub.tv(&name)?;
+    hub.end_share(&tv).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// A full-screen image with a QR code on a white card filling most of the screen, for the TV.
 fn render_share_card(text: &str, w: u32, h: u32) -> anyhow::Result<Vec<u8>> {
     use image::{Rgb, RgbImage};
     let code = qrcode::QrCode::new(text.as_bytes()).map_err(|e| anyhow!("QR code: {e:?}"))?;
     let n = code.width() as u32;
     let quiet = 4;
     let total = n + 2 * quiet;
-    let module = (h.min(w) * 58 / 100 / total).max(1);
+    // As big as the screen allows, so any phone camera can read it from across the room.
+    let module = (h.min(w) * 90 / 100 / total).max(1);
     let side = module * total;
     let (x0, y0) = (w.saturating_sub(side) / 2, h.saturating_sub(side) / 2);
     let mut img = RgbImage::from_pixel(w, h, Rgb([24, 26, 31]));
@@ -1322,7 +1796,7 @@ fn render_share_card(text: &str, w: u32, h: u32) -> anyhow::Result<Vec<u8>> {
             }
         }
     };
-    let border = module * 2;
+    let border = (module / 3).max(2);
     fill(
         x0.saturating_sub(border),
         y0.saturating_sub(border),

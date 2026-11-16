@@ -53,3 +53,18 @@ export function isImage(f: File): boolean {
 }
 
 export const errorMessage = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
+/** A past moment (Unix ms) in words: "just now", "5 minutes ago", "yesterday at 9:14 PM". */
+export function ago(ms: number): string {
+  const s = (Date.now() - ms) / 1000;
+  const rtf = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
+  if (s < 45) return "just now";
+  if (s < 3600) return rtf.format(-Math.round(s / 60), "minute");
+  if (s < 6 * 3600) return rtf.format(-Math.round(s / 3600), "hour");
+  const d = new Date(ms);
+  const time = d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+  const days = Math.round((new Date().setHours(0, 0, 0, 0) - new Date(ms).setHours(0, 0, 0, 0)) / 86400000);
+  if (days === 0) return `today at ${time}`;
+  if (days === 1) return `yesterday at ${time}`;
+  return `${d.toLocaleDateString(undefined, { month: "short", day: "numeric" })} at ${time}`;
+}

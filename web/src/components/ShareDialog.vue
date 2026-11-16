@@ -1,16 +1,14 @@
 <script setup lang="ts">
 import { ref } from "vue";
 import ModalDialog from "./ModalDialog.vue";
-import { S, act, api, closeDialog, isAdmin, shareUrl, tvPath } from "../state";
+import { S, closeDialog, isAdmin, pending, shareUrl, showShareCard } from "../state";
 import { toast } from "../toasts";
-import type { ShareCardRequest } from "../types";
 import { enc } from "../util";
 
 const tv = S.tv!;
 const url = shareUrl();
 const local = /^(https?:\/\/)(localhost|127\.)/.test(url);
 const urlEl = ref<HTMLElement>();
-const sending = ref(false);
 
 async function copy() {
   try {
@@ -22,13 +20,10 @@ async function copy() {
 }
 
 async function showOnTv() {
-  sending.value = true;
-  await act(async () => {
-    await api(tvPath(tv, "/share-card"), { json: { url } satisfies ShareCardRequest });
-    toast("Scan the TV with your phone camera");
+  if (await showShareCard(url)) {
     closeDialog();
-  });
-  sending.value = false;
+    toast("The QR code is on the TV. Press “Done, back to my photos” when you're finished.");
+  }
 }
 </script>
 
@@ -48,8 +43,9 @@ async function showOnTv() {
       With the LocalSend app, phones can also send straight to “{{ tv }}”.
     </p>
     <template #foot="{ close }">
-      <button v-if="isAdmin" :disabled="sending" @click="showOnTv">
-        {{ sending ? "Sending to the TV…" : "Show this QR code on the TV" }}
+      <button v-if="isAdmin" :disabled="!!pending.share" @click="showOnTv">
+        <template v-if="pending.share === 'showing'"><span class="spinner sm"></span>Putting it on the TV…</template>
+        <template v-else>Show this QR code on the TV</template>
       </button>
       <button class="primary" @click="close">Done</button>
     </template>

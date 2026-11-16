@@ -52,7 +52,9 @@ saved in `/config`:
    can delete photos or change settings.
 4. Click **Share…** on a TV to get its guest link and QR code, for example
    `http://<server-ip>:3273/tv/Living%20Room`. **Show this QR code on the TV** puts the code
-   on the TV itself, so guests can scan it with their phone camera.
+   on the TV itself, so guests can scan it with their phone camera. The slideshow pauses while
+   it's up; **Done, back to my photos** puts back what was showing and resumes the slideshow
+   (this also happens on its own after 30 minutes).
 
 To build the image yourself instead of pulling it, run `docker compose up -d --build`.
 
@@ -64,6 +66,7 @@ To build the image yourself instead of pulling it, run `docker compose up -d --b
 | `photos/<tv>/` | Every photo sent through the web page or LocalSend (or the TV's sync folder, if you set one). Reframing re‑crops from these originals. |
 | `state/` | What was uploaded where, used to skip duplicates and to reframe. |
 | `thumbs/` | Thumbnail cache (safe to delete). |
+| `cache/` | The last photo list each TV sent, so pages still load while a TV is off or slow (safe to delete). |
 
 On start, the container hands `/config` to `PUID:PGID` if anyone else owns it.
 
@@ -119,8 +122,9 @@ and a "put it on the TV right away" toggle. Phones open their photo picker direc
 are recognized ("Already on the TV"). iPhone HEIC photos work: Safari sends JPEG anyway, and the
 Docker image decodes HEIC with libheif.
 
-Admins get the full view: a "now showing" preview, art mode and slideshow controls, the photo
-grid with show / reframe / matte / favorite / delete, per‑TV defaults (matte, portrait matte, fit,
+Admins get the full view: a "now showing" preview, art mode, a slideshow (all your photos or
+just favorites, how often, shuffled or not), the photo grid with show / reframe / matte /
+favorite / delete, for one photo or several at once (**Select**, or Ctrl/⌘/Shift‑click), per‑TV defaults (matte, portrait matte, fit,
 folder), folder sync, and Wake. You can drag photos anywhere onto the page or paste a screenshot.
 The page updates live when someone else sends a photo. On a phone, "Add to Home Screen" makes
 it feel like an app.

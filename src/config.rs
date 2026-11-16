@@ -135,6 +135,24 @@ impl TvConfig {
             .and_then(|(w, h)| Some((w.trim().parse().ok()?, h.trim().parse().ok()?)))
             .unwrap_or((3840, 2160))
     }
+
+    /// Screen size in inches, from the model number.
+    pub fn size_inches(&self) -> Option<u32> {
+        self.model.as_deref().and_then(screen_size_inches)
+    }
+}
+
+/// Screen size in inches from a Samsung model number: the digits after its region letters,
+/// e.g. `QN65LS03TAFXZA` and `QE55LS03BAUXXU` → 65 and 55, `UN32LS03` → 32.
+pub fn screen_size_inches(model: &str) -> Option<u32> {
+    let model = model.trim();
+    let digits_at = model.find(|c: char| c.is_ascii_digit())?;
+    if !(1..=3).contains(&digits_at) || !model[..digits_at].chars().all(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    let digits: String = model[digits_at..].chars().take_while(char::is_ascii_digit).collect();
+    let size: u32 = digits.parse().ok()?;
+    (20..=120).contains(&size).then_some(size)
 }
 
 impl Config {
@@ -221,6 +239,16 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn screen_size_from_model() {
+        assert_eq!(screen_size_inches("QN65LS03TAFXZA"), Some(65));
+        assert_eq!(screen_size_inches("QE55LS03BAUXXU"), Some(55));
+        assert_eq!(screen_size_inches("UN32LS03"), Some(32));
+        assert_eq!(screen_size_inches("QN85LS03D"), Some(85));
+        assert_eq!(screen_size_inches("22_PONTUSM_FTV"), None);
+        assert_eq!(screen_size_inches("Frame"), None);
+    }
 
     #[test]
     fn roundtrip_and_lookup() {

@@ -77,7 +77,7 @@ pub struct Thumbnail {
     pub data: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, ts_rs::TS)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ts_rs::TS)]
 #[ts(export)]
 pub struct MatteList {
     pub types: Vec<String>,
@@ -690,8 +690,10 @@ impl ArtClient {
         read_d2d_files(stream.as_mut()).await
     }
 
-    /// Art API < 4: `get_thumbnail` per item (inline bytes on API < 2).
-    async fn thumbnails_one_by_one(&self, content_ids: &[String]) -> Result<Vec<Thumbnail>> {
+    /// `get_thumbnail` per item (inline bytes on API < 2). Art API < 4 only has this; newer TVs
+    /// mostly still answer it, which helps when `get_thumbnail_list` skips an item. Items the TV
+    /// has no thumbnail for are left out (an error only if that's the only one asked for).
+    pub async fn thumbnails_one_by_one(&self, content_ids: &[String]) -> Result<Vec<Thumbnail>> {
         let mut out = Vec::new();
         for id in content_ids {
             let msg = self

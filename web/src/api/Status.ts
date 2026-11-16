@@ -5,4 +5,8 @@ import type { Slideshow } from "./Slideshow";
 /**
  * `GET /api/tvs/{tv}/status`. Each part is `null` if the TV didn't answer that question.
  */
-export type Status = { artmode: boolean | null, current: Current | null, slideshow: Slideshow | null, };
+export type Status = { artmode: boolean | null, current: Current | null, slideshow: Slideshow | null, 
+/**
+ * A QR code card is up on the TV (see `POST .../share-card`).
+ */
+sharing: boolean, };

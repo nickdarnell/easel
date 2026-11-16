@@ -4,4 +4,8 @@ export type Slideshow = {
 /**
  * Minutes between photos, or `null` when it's off.
  */
-minutes: number | null, shuffle: boolean, };
+minutes: number | null, shuffle: boolean, 
+/**
+ * Playing only the favorites, not all of My Photos.
+ */
+favorites: boolean, };

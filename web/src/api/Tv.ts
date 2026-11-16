@@ -7,6 +7,10 @@ import type { Power } from "./Power";
  */
 export type Tv = { name: string, host: string, model: string | null, 
 /**
+ * Screen size in inches (from the model number).
+ */
+size_inches: number | null, 
+/**
  * Panel size in pixels, landscape.
  */
 resolution: [number, number], 

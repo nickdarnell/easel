@@ -1,5 +1,19 @@
 import { computed, reactive, ref, watch } from "vue";
-import type { Filter, Info, MatteList, Photo, Settings, SlideshowUpdate, Status, Toggle, Tv } from "./types";
+import type {
+  Deleted,
+  Filter,
+  Info,
+  MatteList,
+  MatteUpdate,
+  Photo,
+  PhotoIds,
+  PhotoList,
+  Settings,
+  SlideshowUpdate,
+  Status,
+  Toggle,
+  Tv,
+} from "./types";
 import { toast } from "./toasts";
 import { enc, errorMessage, sleep, store } from "./util";
 
@@ -13,6 +27,8 @@ export const S = reactive({
   statusErr: null as string | null,
   photos: null as Photo[] | null,
   photosErr: null as string | null,
+  /** Set when the TV couldn't be reached, so `photos` is the last list it sent. */
+  photosOffline: null as { reason: string; asOf: number } | null,
   filter: "all" as Filter,
   mattes: null as MatteList | null,
   pw: store.get("pw", ""),
@@ -25,6 +41,30 @@ watch(
   () => S.showNow,
   (v) => store.set("showNow", v),
 );
+
+/**
+ * Changes sent to the TV that haven't shown up in what it reports yet. Controls show the new
+ * value with a spinner meanwhile, rather than snapping back to the old one.
+ */
+export const pending = reactive({
+  art: null as boolean | null,
+  slideshow: null as SlideshowChoice | null,
+  share: null as "showing" | "ending" | null,
+  /** What's happening to the selected photos, e.g. "Deleting 3…". */
+  photos: null as string | null,
+  /** The photo being put on the screen. */
+  show: null as string | null,
+});
+
+/** Photos ticked in the grid, for acting on several at once. */
+export const selection = reactive({ on: false, ids: new Set<string>() });
+
+export interface SlideshowChoice {
+  /** 0 is off. */
+  minutes: number;
+  favorites: boolean;
+  shuffle: boolean;
+}
 
 export const curTv = computed(() => S.tvs.find((t) => t.name === S.tv));
 /** Admin controls are shown to admins, but never on the guest page. */
@@ -140,7 +180,9 @@ watch(
 
 export async function loadTv() {
   const tv = curTv.value;
-  if (!tv || tv.power !== "on") return;
+  if (!tv) return;
+  // The server keeps the last photo list each TV sent, so photos show even while it's off.
+  if (tv.power !== "on") return loadPhotos();
   await Promise.all([loadStatus(), loadPhotos()]);
 }
 
@@ -162,9 +204,10 @@ export async function loadPhotos() {
   const name = S.tv;
   if (!name) return;
   try {
-    const p = await api<Photo[]>(tvPath(name, "/photos" + (S.filter === "favorites" ? "?category=favorites" : "")));
+    const p = await api<PhotoList>(tvPath(name, "/photos" + (S.filter === "favorites" ? "?category=favorites" : "")));
     if (name === S.tv) {
-      S.photos = p;
+      S.photos = p.photos;
+      S.photosOffline = p.offline ? { reason: p.offline, asOf: p.as_of } : null;
       S.photosErr = null;
     }
   } catch (e) {
@@ -174,8 +217,9 @@ export async function loadPhotos() {
 
 export function selectTv(name: string) {
   if (name === S.tv) return;
+  endSelection();
   S.tv = name;
-  S.status = S.photos = S.statusErr = S.photosErr = S.mattes = null;
+  S.status = S.photos = S.statusErr = S.photosErr = S.photosOffline = S.mattes = null;
   S.filter = "all";
   store.set("tv", name);
   history.replaceState(null, "", "#" + enc(name));
@@ -183,6 +227,7 @@ export function selectTv(name: string) {
 
 export function setFilter(f: Filter) {
   const prev = S.filter;
+  endSelection();
   S.filter = f;
   if ((prev === "favorites") !== (f === "favorites")) {
     S.photos = null;
@@ -205,18 +250,137 @@ export function thumbsArrived(ids: string[]) {
 }
 
 // ── TV actions ───────────────────────────────────────────────────────
-export function toggleArt() {
-  return act(async () => {
-    await api(tvPath(S.tv!, "/artmode"), { json: { on: S.status?.artmode === false } satisfies Toggle });
-    setTimeout(loadStatus, 1200);
-  });
+/** Re-read the TV's status until `done` holds (the TV can take a few seconds to apply things). */
+async function settle(done: () => boolean, tries = 8) {
+  for (let i = 0; i < tries; i++) {
+    await loadStatus();
+    if (done()) return true;
+    await sleep(1200);
+  }
+  return false;
 }
 
-export function setSlideshow(minutes: number) {
-  return act(async () => {
-    await api(tvPath(S.tv!, "/slideshow"), { json: { minutes, shuffle: true } satisfies SlideshowUpdate });
-    toast(minutes ? "Slideshow on" : "Slideshow off");
+export async function toggleArt() {
+  const on = S.status?.artmode === false;
+  pending.art = on;
+  await act(async () => {
+    await api(tvPath(S.tv!, "/artmode"), { json: { on } satisfies Toggle });
+    await settle(() => S.status?.artmode === on);
   });
+  pending.art = null;
+}
+
+/** The slideshow as the TV reports it (minutes 0 when off). */
+export const slideshow = computed<SlideshowChoice>(() => ({
+  minutes: S.status?.slideshow?.minutes || 0,
+  favorites: !!S.status?.slideshow?.favorites,
+  shuffle: S.status?.slideshow?.shuffle ?? true,
+}));
+
+export async function setSlideshow(want: SlideshowChoice) {
+  pending.slideshow = want;
+  const was = slideshow.value.minutes;
+  await act(async () => {
+    await api(tvPath(S.tv!, "/slideshow"), {
+      json: { minutes: want.minutes, shuffle: want.shuffle, favorites: want.favorites } satisfies SlideshowUpdate,
+    });
+    await settle(() => slideshow.value.minutes === want.minutes);
+    if (!want.minutes) toast("Slideshow stopped");
+    else toast(was ? "Slideshow updated" : "Slideshow started");
+  });
+  pending.slideshow = null;
+}
+
+export async function showPhoto(id: string) {
+  pending.show = id;
+  await act(async () => {
+    await api(tvPath(S.tv!, `/photos/${enc(id)}/show`), { method: "POST" });
+    await settle(() => S.status?.current?.content_id === id, 6);
+  });
+  pending.show = null;
+}
+
+// ── sharing ──────────────────────────────────────────────────────────
+export async function showShareCard(url: string) {
+  pending.share = "showing";
+  let ok = false;
+  await act(async () => {
+    await api(tvPath(S.tv!, "/share-card"), { json: { url } });
+    await settle(() => !!S.status?.sharing, 3);
+    ok = true;
+  });
+  pending.share = null;
+  return ok;
+}
+
+/** Take the QR code down and go back to the photos (and the slideshow, if one was running). */
+export async function endShare() {
+  pending.share = "ending";
+  await act(async () => {
+    await api(tvPath(S.tv!, "/share-card"), { method: "DELETE" });
+    await settle(() => !S.status?.sharing, 3);
+    toast("Back to your photos");
+  });
+  pending.share = null;
+}
+
+// ── several photos at once ───────────────────────────────────────────
+export function toggleSelected(id: string) {
+  selection.on = true;
+  if (!selection.ids.delete(id)) selection.ids.add(id);
+}
+
+export function endSelection() {
+  selection.on = false;
+  selection.ids.clear();
+}
+
+async function eachSelected(label: string, fn: (id: string) => Promise<unknown>) {
+  const ids = [...selection.ids];
+  let done = 0;
+  pending.photos = `${label} ${ids.length}…`;
+  await act(async () => {
+    for (const id of ids) {
+      await fn(id);
+      pending.photos = `${label} ${ids.length - ++done}…`;
+    }
+  });
+  pending.photos = null;
+  return done;
+}
+
+export async function favoriteSelected(on: boolean) {
+  const n = await eachSelected(on ? "Adding" : "Removing", (id) =>
+    api(tvPath(S.tv!, `/photos/${enc(id)}/favorite`), { json: { on } satisfies Toggle }),
+  );
+  if (n) toast(`${n} ${n === 1 ? "photo" : "photos"} ${on ? "added to" : "removed from"} favorites`);
+  endSelection();
+  if (S.filter === "favorites") loadPhotos();
+}
+
+export async function matteSelected(matte: string) {
+  const n = await eachSelected("Changing", async (id) => {
+    await api(tvPath(S.tv!, `/photos/${enc(id)}/matte`), { json: { matte, portrait: null } satisfies MatteUpdate });
+    const p = S.photos?.find((x) => x.id === id);
+    if (p) p.matte = matte;
+  });
+  if (n) toast(`Matte changed on ${n} ${n === 1 ? "photo" : "photos"}`);
+}
+
+export async function deleteSelected() {
+  const ids = [...selection.ids];
+  pending.photos = `Deleting ${ids.length}…`;
+  await act(async () => {
+    const r = await api<Deleted[]>(tvPath(S.tv!, "/photos/delete"), { json: { ids } satisfies PhotoIds });
+    const gone = new Set(r.map((d) => d.deleted));
+    if (S.photos) S.photos = S.photos.filter((p) => !gone.has(p.id));
+    const moved = r.filter((d) => d.moved_source_to).length;
+    toast(
+      `Deleted ${r.length} ${r.length === 1 ? "photo" : "photos"}` + (moved ? " (originals moved to .removed)" : ""),
+    );
+    endSelection();
+  });
+  pending.photos = null;
 }
 
 export function wake() {

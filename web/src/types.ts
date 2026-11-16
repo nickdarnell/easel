@@ -15,6 +15,8 @@ export type * from "./api/MatteList";
 export type * from "./api/MatteUpdate";
 export type * from "./api/Paired";
 export type * from "./api/Photo";
+export type * from "./api/PhotoIds";
+export type * from "./api/PhotoList";
 export type * from "./api/Power";
 export type * from "./api/Reframed";
 export type * from "./api/ServerEvent";
