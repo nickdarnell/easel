@@ -34,7 +34,8 @@ use samsung_frame::protocol::category;
 use samsung_frame::sync::{self, Framing, TvState};
 use samsung_frame::{discovery, image_prep, localsend, pairing, rest, wol};
 
-const INDEX_HTML: &str = include_str!("web/index.html");
+// The web UI (`web/`), embedded by build.rs.
+include!(concat!(env!("OUT_DIR"), "/web_files.rs"));
 const MAX_UPLOAD: usize = 512 * 1024 * 1024;
 
 pub struct ServeOptions {
@@ -418,6 +419,7 @@ pub async fn run(cfg: Config, cfg_path: PathBuf, state_dir: PathBuf, opts: Serve
     let app = Router::new()
         .route("/", get(index))
         .route("/tv/{tv}", get(index))
+        .route("/assets/{*path}", get(asset))
         .route("/manifest.webmanifest", get(manifest))
         .route("/api/info", get(info))
         .route("/api/settings", get(get_settings).put(put_settings))
@@ -537,8 +539,31 @@ async fn start_localsend(hub: &Shared, pin: Option<String>) -> anyhow::Result<lo
     Ok(receiver)
 }
 
+fn web_file(path: &str) -> Option<&'static [u8]> {
+    WEB_FILES.iter().find(|(name, _)| *name == path).map(|(_, data)| *data)
+}
+
 async fn index() -> impl IntoResponse {
-    ([(header::CACHE_CONTROL, "no-cache")], Html(INDEX_HTML))
+    let page = web_file("index.html").unwrap_or_default();
+    ([(header::CACHE_CONTROL, "no-cache")], Html(page))
+}
+
+/// Built scripts and styles. Their names carry a content hash, so they can be cached for good.
+async fn asset(UrlPath(path): UrlPath<String>) -> Response {
+    let Some(data) = web_file(&format!("assets/{path}")) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let kind = match path.rsplit_once('.').map_or("", |(_, ext)| ext) {
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "woff2" => "font/woff2",
+        "map" | "json" => "application/json",
+        _ => "application/octet-stream",
+    };
+    ([(header::CONTENT_TYPE, kind), (header::CACHE_CONTROL, "public, max-age=31536000, immutable")], data)
+        .into_response()
 }
 
 async fn manifest() -> impl IntoResponse {

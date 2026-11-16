@@ -164,6 +164,19 @@ on Linux.
 ```sh
 # Linux needs: apt install pkg-config libssl-dev libheif-dev libheif-plugin-libde265
 # macOS needs: brew install libheif
+cd web && npm ci && npm run build && cd ..   # the web UI (Node 22+), embedded into the binary
 cargo build --release
 cargo test
 ```
+
+The web UI is Vue + TypeScript in `web/`. Without `web/dist`, cargo still builds, but embeds a
+placeholder page instead of the UI. While working on the UI, run the server and Vite's dev
+server side by side; Vite reloads on save and passes `/api` through to the server:
+
+```sh
+cargo run --bin frametv -- serve     # http://localhost:3273
+cd web && npm run dev                # http://localhost:5173
+```
+
+Before committing: `npm run format` (Prettier) in `web/`, and `cargo fmt` and
+`cargo clippy --all-targets -- -D warnings` for the Rust side.

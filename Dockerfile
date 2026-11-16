@@ -2,6 +2,14 @@
 # Easel: guests open http://<host>:3273/tv/<name> and send photos to that TV.
 # Everything (TVs, password, settings, received photos) lives in the /config volume.
 
+# The web UI (Vue + TypeScript), built to static files that get embedded into the binary.
+FROM --platform=$BUILDPLATFORM node:26-slim AS web
+WORKDIR /web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+COPY web/ ./
+RUN npm run build
+
 FROM rust:1-slim-trixie AS build
 RUN apt-get update \
  && apt-get install -y --no-install-recommends pkg-config libssl-dev libheif-dev \
@@ -18,10 +26,12 @@ RUN mkdir -p src/bin/frametv \
  && cargo build --release --locked --bin frametv \
  && rm -rf src
 
-# Then the app itself. Touch the sources so cargo rebuilds them over the placeholder build
-# (COPY keeps the files' original, possibly older, timestamps).
+# Then the app itself, with the built web UI (build.rs embeds web/dist). Touch the sources so
+# cargo rebuilds them over the placeholder build (COPY keeps the files' original timestamps).
+COPY build.rs ./
 COPY src ./src
-RUN find src -type f -exec touch {} + \
+COPY --from=web /web/dist ./web/dist
+RUN find build.rs src web -type f -exec touch {} + \
  && cargo build --release --locked --bin frametv \
  && cp target/release/frametv /usr/local/bin/frametv
 

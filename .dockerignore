@@ -6,3 +6,5 @@ config
 *.md
 compose.yaml
 Dockerfile
+web/node_modules
+web/dist
