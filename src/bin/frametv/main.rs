@@ -48,7 +48,7 @@ struct Cli {
 enum Command {
     /// Find Samsung TVs on the network.
     Discover {
-        /// Also probe every address on the local /24 (slower; for networks that block SSDP).
+        /// Also probe every address on the local /24 and on a.b.0-5.* (slower; for networks that block SSDP).
         #[arg(long)]
         scan: bool,
         /// Seconds to wait for SSDP replies.
@@ -831,7 +831,7 @@ async fn discover(app: &App, scan: bool, wait: u64) -> Result<()> {
     let mut found = discovery::ssdp(Duration::from_secs(wait)).await?;
     if scan || found.is_empty() {
         if !scan {
-            eprintln!("nothing answered SSDP; scanning the local subnet...");
+            eprintln!("nothing answered SSDP; scanning nearby subnets...");
         }
         let seen: HashSet<_> = found.iter().map(|d| d.ip).collect();
         found.extend(discovery::scan_subnet().await?.into_iter().filter(|d| !seen.contains(&d.ip)));

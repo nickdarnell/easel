@@ -1,10 +1,12 @@
-//! Finding Samsung TVs on the LAN: SSDP first, optional /24 port scan as a fallback.
+//! Finding Samsung TVs on the LAN: SSDP first, a port scan of nearby /24 subnets as a fallback.
 
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::{TcpStream, UdpSocket};
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::rest::{self, DeviceInfo};
@@ -45,18 +47,41 @@ pub async fn ssdp(wait: Duration) -> Result<Vec<Discovered>> {
     Ok(confirm(candidates).await)
 }
 
-/// Probe every host of the local /24 on the REST port. Slower but works where multicast is
-/// filtered (mesh Wi-Fi, VLANs, some Windows firewall profiles).
+/// The `x` in `a.b.x.*` that [`scan_subnet`] also probes, besides this machine's own /24. Mesh
+/// Wi-Fi and some routers put devices on neighbouring subnets, e.g. `192.168.0.*` and `192.168.1.*`.
+const NEARBY_SUBNETS: std::ops::RangeInclusive<u8> = 0..=5;
+
+/// How many connection attempts are in flight at once, to stay well under the open-file limit.
+const SCAN_CONCURRENCY: usize = 256;
+
+/// Probe every host on the REST port, across this machine's /24 and the nearby ones (`a.b.0.*`
+/// to `a.b.5.*`). Slower than SSDP but works where multicast is filtered (mesh Wi-Fi, VLANs,
+/// some Windows firewall profiles).
 pub async fn scan_subnet() -> Result<Vec<Discovered>> {
     let Some(IpAddr::V4(local)) = local_ipv4() else {
         return Ok(vec![]);
     };
-    let [a, b, c, _] = local.octets();
+    let mut remaining = scan_targets(local);
+    let mut open = BTreeSet::new();
+    // In a burst of connections, the first one to a sleepy Wi-Fi TV is sometimes lost (often
+    // while the network is still resolving its address), so whatever didn't answer gets a second try.
+    for _ in 0..2 {
+        let found = probe(&remaining).await;
+        remaining.retain(|ip| !found.contains(ip));
+        open.extend(found.into_iter().map(IpAddr::V4));
+    }
+    Ok(confirm(open).await)
+}
+
+/// Which of `ips` accept a connection on the REST port.
+async fn probe(ips: &[Ipv4Addr]) -> BTreeSet<Ipv4Addr> {
+    let limit = Arc::new(Semaphore::new(SCAN_CONCURRENCY));
     let mut probes = JoinSet::new();
-    for d in 1..=254u8 {
-        let ip = IpAddr::V4(Ipv4Addr::new(a, b, c, d));
+    for &ip in ips {
+        let limit = limit.clone();
         probes.spawn(async move {
-            let addr = SocketAddr::new(ip, protocol::REST_PORT);
+            let _permit = limit.acquire_owned().await.ok()?;
+            let addr = SocketAddr::new(IpAddr::V4(ip), protocol::REST_PORT);
             matches!(tokio::time::timeout(Duration::from_millis(400), TcpStream::connect(addr)).await, Ok(Ok(_)))
                 .then_some(ip)
         });
@@ -67,7 +92,19 @@ pub async fn scan_subnet() -> Result<Vec<Discovered>> {
             open.insert(ip);
         }
     }
-    Ok(confirm(open).await)
+    open
+}
+
+/// Every host address [`scan_subnet`] probes for a machine at `local`, its own /24 first.
+fn scan_targets(local: Ipv4Addr) -> Vec<Ipv4Addr> {
+    let [a, b, own, _] = local.octets();
+    let mut subnets = vec![own];
+    subnets.extend(NEARBY_SUBNETS.filter(|&c| c != own));
+    subnets
+        .into_iter()
+        .flat_map(|c| (1..=254).map(move |d| Ipv4Addr::new(a, b, c, d)))
+        .filter(|&ip| ip != local)
+        .collect()
 }
 
 async fn confirm(ips: BTreeSet<IpAddr>) -> Vec<Discovered> {
@@ -93,4 +130,25 @@ pub fn local_ipv4() -> Option<IpAddr> {
     let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("8.8.8.8:80").ok()?;
     Some(socket.local_addr().ok()?.ip())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scans_own_subnet_and_neighbours() {
+        let targets = scan_targets(Ipv4Addr::new(192, 168, 1, 20));
+        assert_eq!(targets.len(), 6 * 254 - 1);
+        assert_eq!(targets[0], Ipv4Addr::new(192, 168, 1, 1));
+        assert!(!targets.contains(&Ipv4Addr::new(192, 168, 1, 20)));
+        assert!(targets.contains(&Ipv4Addr::new(192, 168, 0, 17)));
+        assert!(targets.contains(&Ipv4Addr::new(192, 168, 5, 254)));
+        assert!(!targets.contains(&Ipv4Addr::new(192, 168, 6, 1)));
+
+        // A machine outside 0-5 still scans its own subnet, plus 0-5.
+        let targets = scan_targets(Ipv4Addr::new(10, 0, 42, 7));
+        assert_eq!(targets.len(), 7 * 254 - 1);
+        assert_eq!(targets[0], Ipv4Addr::new(10, 0, 42, 1));
+    }
 }
