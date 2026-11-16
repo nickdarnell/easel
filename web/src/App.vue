@@ -6,6 +6,8 @@ import ComposerDialog from "./components/ComposerDialog.vue";
 import HeroPanel from "./components/HeroPanel.vue";
 import PasswordDialog from "./components/PasswordDialog.vue";
 import PhotoDialog from "./components/PhotoDialog.vue";
+import QueueDialog from "./components/QueueDialog.vue";
+import RemoteDialog from "./components/RemoteDialog.vue";
 import PhotoGrid from "./components/PhotoGrid.vue";
 import ShareDialog from "./components/ShareDialog.vue";
 import ToastList from "./components/ToastList.vue";
@@ -24,7 +26,6 @@ import {
   openAppSettings,
   openDialog,
   selectTv,
-  tvReady,
 } from "./state";
 import { errorMessage, store } from "./util";
 
@@ -40,6 +41,8 @@ const dialogs: Record<string, Component> = {
   share: ShareDialog,
   password: PasswordDialog,
   composer: ComposerDialog,
+  queue: QueueDialog,
+  remote: RemoteDialog,
 };
 const dialogProps = computed(() => {
   const d = dialog.value;
@@ -62,7 +65,8 @@ watchEffect(() => {
 // ── drag & drop anywhere, and pasting images ─────────────────────────
 const dragDepth = ref(0);
 const hasFiles = (e: DragEvent) => [...(e.dataTransfer?.types || [])].includes("Files");
-const canReceive = () => !!S.tv && tvReady.value && (!dialog.value || composing());
+// The server keeps photos for a TV that's off, and sends them when it's on.
+const canReceive = () => !!S.tv && (!dialog.value || composing());
 const targets = () => composer.value?.tvs || [S.tv!];
 
 addEventListener("dragenter", (e) => {

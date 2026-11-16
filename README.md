@@ -86,6 +86,7 @@ for the same tag, so it works whether you follow `latest` or pin something like 
 | `state/` | What was uploaded where, used to skip duplicates and to reframe. |
 | `thumbs/` | Thumbnail cache (safe to delete). |
 | `cache/` | The last photo list each TV sent, so pages still load while a TV is off or slow (safe to delete). |
+| `pending/` | Changes waiting for each TV (see [Changes wait for the TV](#changes-wait-for-the-tv)). |
 
 On start, the container hands `/config` to `PUID:PGID` if anyone else owns it.
 
@@ -133,6 +134,34 @@ photos, a filmstrip lets you frame each one or **use this framing for all**.
 
 Changed your mind later? Open a photo and choose **Reframe…**. It goes back to the original,
 re‑uploads it with the new framing, and swaps it in (keeping it on screen if it was showing).
+
+## Changes wait for the TV
+
+Frame TVs are often asleep, slow to wake, or briefly unresponsive. So changes to photos and the
+slideshow don't make you wait: adding, deleting, reframing, mattes, favorites, and slideshow
+settings are written down at once and made on the TV whenever it answers, oldest first. They
+survive a restart. You can keep working while the TV is off, and it catches up when it's back.
+
+- A pill next to the TV's name says whether it's **up to date** or how many changes are
+  **waiting** (or **failed**). Click it to see what the server is waiting on: what it's asking
+  the TV right now and for how long, and each waiting change with its last error and when it
+  will try again. From there you can **Try now** (which wakes the TV if it can) or **Cancel** a
+  change.
+- Photos waiting to be added show at the front of the grid. Photos with unsynced changes are
+  marked, and ones being deleted are dimmed.
+- A new change replaces an older waiting one it makes pointless (a second slideshow change, a
+  second matte for the same photo, a change to a photo that's being deleted).
+- The first try after you ask is eager: it wakes the TV and waits for it. Later retries only
+  happen while the TV is on (they back off up to 5 minutes, and resume as soon as the TV
+  answers). If the TV turns a change down three times, it's marked failed and kept until you
+  retry or cancel it.
+
+Things that only make sense now happen straight away instead: showing a photo, art mode, the
+QR code, wake, and the remote.
+
+**Remote**: the **Remote** button opens a remote control for the TV (power, home, source,
+menu, arrows and OK, back, volume, channels, playback). Tapping power switches between art mode
+and TV; holding it turns the TV off. The arrow keys, Enter, and Backspace work too.
 
 ## What guests see
 

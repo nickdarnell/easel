@@ -165,6 +165,26 @@ impl Waiter {
     }
 }
 
+/// A request on its way, listed in [`Router::asking`] until it's answered or given up on.
+struct Asking<'a> {
+    router: &'a Router,
+    serial: u64,
+}
+
+impl<'a> Asking<'a> {
+    fn new(router: &'a Router, name: &str) -> Self {
+        let serial = router.serial.fetch_add(1, Ordering::Relaxed);
+        router.asking.lock().unwrap().push((serial, name.to_owned(), std::time::Instant::now()));
+        Asking { router, serial }
+    }
+}
+
+impl Drop for Asking<'_> {
+    fn drop(&mut self) {
+        self.router.asking.lock().unwrap().retain(|(s, _, _)| *s != self.serial);
+    }
+}
+
 /// A recent request, to tell its reply from the TV's own news.
 struct Sent {
     id: String,
@@ -178,6 +198,8 @@ struct Router {
     events: broadcast::Sender<ArtMessage>,
     /// Thumbnails that came after their request gave up waiting.
     late: broadcast::Sender<Thumbnail>,
+    /// Requests waiting for their reply right now: serial, request name, when sent.
+    asking: StdMutex<Vec<(u64, String, std::time::Instant)>>,
     serial: AtomicU64,
     closed: AtomicBool,
 }
@@ -471,6 +493,7 @@ impl ArtClient {
         let router = Arc::new(Router {
             waiters: StdMutex::new(Vec::new()),
             sent: StdMutex::new(std::collections::VecDeque::new()),
+            asking: StdMutex::new(Vec::new()),
             events: events_tx,
             late: late_tx,
             serial: AtomicU64::new(0),
@@ -554,11 +577,18 @@ impl ArtClient {
             });
         }
         let pending = self.router.register(Some(id), wait_event.map(str::to_owned))?;
+        let _asking = Asking::new(&self.router, &name);
         let envelope = protocol::art_request_envelope(&request);
         tracing::trace!(target: "samsung_frame::wire", "-> {envelope}");
         self.send_ws(Message::Text(envelope.to_string().into())).await?;
         let msg = pending.wait(timeout, &format!("reply to `{name}`")).await?;
         check_error(msg, &name)
+    }
+
+    /// The request that has been waiting longest for its reply, and for how long.
+    pub fn waiting_on(&self) -> Option<(String, Duration)> {
+        let asking = self.router.asking.lock().unwrap();
+        asking.iter().min_by_key(|(_, _, at)| *at).map(|(_, name, at)| (name.clone(), at.elapsed()))
     }
 
     pub async fn request(&self, request: Value) -> Result<ArtMessage> {

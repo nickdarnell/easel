@@ -1,6 +1,7 @@
-// The upload queue: one upload at a time per TV, with progress.
+// The upload panel: photos going to the server, one at a time per TV, with progress. The server
+// keeps them and sends them on whenever the TV answers (see the TV's waiting changes).
 import { reactive } from "vue";
-import type { ErrorBody, Framing, Uploaded } from "./types";
+import type { ErrorBody, Framing, Queued } from "./types";
 import { S, tvPath } from "./state";
 import { enc, errorMessage } from "./util";
 
@@ -58,9 +59,9 @@ async function pump(tv: string) {
     item.status = "sending";
     item.msg = "Uploading";
     try {
-      const r = await sendOne(item);
+      await sendOne(item);
       item.status = "done";
-      item.msg = r.duplicate ? "Already on the TV" : r.shown ? "On the TV now" : "Added";
+      item.msg = "Saved, going to the TV";
     } catch (e) {
       item.status = "failed";
       item.msg = errorMessage(e);
@@ -91,7 +92,7 @@ async function prepareFile(file: File): Promise<{ body: Blob; name: string; type
   return { body: file, name: file.name, type: file.type || "application/octet-stream" };
 }
 
-async function sendOne(item: QueueItem): Promise<Uploaded> {
+async function sendOne(item: QueueItem): Promise<Queued> {
   const f = await prepareFile(item.file);
   // XMLHttpRequest rather than fetch, for upload progress.
   return new Promise((resolve, reject) => {
@@ -108,7 +109,7 @@ async function sendOne(item: QueueItem): Promise<Uploaded> {
     x.upload.onprogress = (e) => {
       if (!e.lengthComputable) return;
       item.pct = Math.round((e.loaded / e.total) * 100);
-      item.msg = item.pct < 100 ? `Uploading ${item.pct}%` : "Preparing on the TV…";
+      item.msg = item.pct < 100 ? `Uploading ${item.pct}%` : "Saving…";
     };
     x.onload = () => {
       let body: unknown = null;
@@ -117,7 +118,7 @@ async function sendOne(item: QueueItem): Promise<Uploaded> {
       } catch {
         // Not JSON: report the status.
       }
-      if (x.status === 200) resolve(body as Uploaded);
+      if (x.status === 202 || x.status === 200) resolve(body as Queued);
       else reject(new Error((body as Partial<ErrorBody> | null)?.error || `Failed (${x.status})`));
     };
     x.onerror = () => reject(new Error("Network error"));

@@ -1,6 +1,7 @@
 import { computed, reactive, ref, watch } from "vue";
 import type {
-  Deleted,
+  Change,
+  ChangeOp,
   Filter,
   Info,
   MatteList,
@@ -11,8 +12,10 @@ import type {
   Settings,
   SlideshowUpdate,
   Status,
+  KeyPress,
   Toggle,
   Tv,
+  TvQueue,
 } from "./types";
 import { toast } from "./toasts";
 import { enc, errorMessage, sleep, store } from "./util";
@@ -35,6 +38,8 @@ export const S = reactive({
   /** Set on `/tv/<name>`: the guest page for one TV. */
   guestTv: guestMatch ? decodeURIComponent(guestMatch[1]!) : null,
   showNow: store.get("showNow", true),
+  /** Changes waiting to be made on the TV, and what it's being asked right now. */
+  queue: null as TvQueue | null,
 });
 
 watch(
@@ -86,7 +91,9 @@ export type Dialog =
   | { kind: "addTv" }
   | { kind: "share" }
   | { kind: "password" }
-  | { kind: "composer" };
+  | { kind: "composer" }
+  | { kind: "queue" }
+  | { kind: "remote" };
 
 export const dialog = ref<(Dialog & { key: number }) | null>(null);
 let dialogKey = 0;
@@ -197,7 +204,18 @@ export async function loadTv() {
   if (!tv) return;
   // The server answers both from what it last heard (so photos show even while the TV is off),
   // and asks the TV in the background, waking it if need be.
-  await Promise.all([loadStatus(), loadPhotos()]);
+  await Promise.all([loadStatus(), loadPhotos(), loadQueue()]);
+}
+
+export async function loadQueue() {
+  const name = S.tv;
+  if (!name || !isAdmin.value) return;
+  try {
+    const q = await api<TvQueue>(tvPath(name, "/queue"));
+    if (name === S.tv) S.queue = q;
+  } catch {
+    // Shown again on the next event.
+  }
 }
 
 export async function loadStatus() {
@@ -234,7 +252,7 @@ export function selectTv(name: string) {
   if (name === S.tv) return;
   endSelection();
   S.tv = name;
-  S.status = S.photos = S.statusErr = S.photosErr = S.photosOffline = S.mattes = null;
+  S.status = S.photos = S.statusErr = S.photosErr = S.photosOffline = S.mattes = S.queue = null;
   S.filter = "all";
   store.set("tv", name);
   history.replaceState(null, "", "#" + enc(name));
@@ -265,6 +283,58 @@ export function thumbsArrived(ids: string[]) {
     thumbRev.set(id, (thumbRev.get(id) ?? 0) + 1);
   }
 }
+
+// ── waiting changes ──────────────────────────────────────────────────
+/** Changes to the selected TV that haven't been made yet (including ones it turned down). */
+export const changes = computed<Change[]>(() => S.queue?.changes ?? []);
+type Op<K extends ChangeOp["kind"]> = Extract<ChangeOp, { kind: K }>;
+const ofKind = <K extends ChangeOp["kind"]>(kind: K) =>
+  changes.value.filter((c): c is Change & { op: Op<K> } => c.op.kind === kind);
+
+/** Photos waiting to be sent. */
+export const waitingUploads = computed(() => ofKind("upload"));
+/** Photos waiting to be deleted. */
+export const waitingDeletes = computed(() => new Set(ofKind("delete").flatMap((c) => c.op.ids)));
+/** The slideshow as it'll be once the last waiting change to it is made. */
+export const waitingSlideshow = computed<SlideshowChoice | null>(() => {
+  const c = ofKind("slideshow").at(-1);
+  return c ? { minutes: c.op.minutes ?? 0, shuffle: c.op.shuffle, favorites: c.op.favorites } : null;
+});
+
+/** The waiting changes to one photo (matte, favorite, reframe, delete). */
+export function changesTo(id: string): Change[] {
+  return changes.value.filter(
+    (c) => ("id" in c.op && c.op.id === id) || (c.op.kind === "delete" && c.op.ids.includes(id)),
+  );
+}
+
+/** The photo's matte, as it'll be once waiting changes are made. */
+export function wantedMatte(p: Photo): string | null {
+  const c = ofKind("matte")
+    .filter((c) => c.op.id === p.id)
+    .at(-1);
+  return c ? c.op.matte : p.matte;
+}
+
+/** Try a change again now (waking the TV if need be). */
+export const retryChange = (id: number) =>
+  act(async () => {
+    await api(tvPath(S.tv!, `/queue/${id}`), { method: "POST" });
+  });
+
+/** Give up on a change. */
+export const dropChange = (id: number) =>
+  act(async () => {
+    await api(tvPath(S.tv!, `/queue/${id}`), { method: "DELETE" });
+  });
+
+/** Press a button on the TV's remote (held down for `holdMs`, if given). */
+export const pressKey = (key: string, holdMs?: number) =>
+  act(async () => {
+    await api(tvPath(S.tv!, "/key"), { json: { key, hold_ms: holdMs ?? null } satisfies KeyPress });
+  });
+
+const photos = (n: number) => `${n} ${n === 1 ? "photo" : "photos"}`;
 
 // ── TV actions ───────────────────────────────────────────────────────
 /** Wait up to `seconds` for the TV's status to show `done` (it can take a few seconds to apply
@@ -307,8 +377,11 @@ export async function setSlideshow(want: SlideshowChoice) {
     await api(tvPath(S.tv!, "/slideshow"), {
       json: { minutes: want.minutes, shuffle: want.shuffle, favorites: want.favorites } satisfies SlideshowUpdate,
     });
-    await settle(() => slideshow.value.minutes === want.minutes);
-    if (!want.minutes) toast("Slideshow stopped");
+    // Made whenever the TV answers: usually straight away.
+    const made =
+      tvReady.value && (await settle(() => !waitingSlideshow.value && slideshow.value.minutes === want.minutes, 10));
+    if (!made && waitingSlideshow.value) toast(`The slideshow will change when ${S.tv} answers`);
+    else if (!want.minutes) toast("Slideshow stopped");
     else toast(was ? "Slideshow updated" : "Slideshow started");
   });
   pending.slideshow = null;
@@ -358,14 +431,15 @@ export function endSelection() {
   selection.ids.clear();
 }
 
-async function eachSelected(label: string, fn: (id: string) => Promise<unknown>) {
+/** Ask for a change to each selected photo. They're made whenever the TV answers. */
+async function eachSelected(fn: (id: string) => Promise<unknown>) {
   const ids = [...selection.ids];
   let done = 0;
-  pending.photos = `${label} ${ids.length}…`;
+  pending.photos = "Saving…";
   await act(async () => {
     for (const id of ids) {
       await fn(id);
-      pending.photos = `${label} ${ids.length - ++done}…`;
+      done++;
     }
   });
   pending.photos = null;
@@ -373,34 +447,26 @@ async function eachSelected(label: string, fn: (id: string) => Promise<unknown>)
 }
 
 export async function favoriteSelected(on: boolean) {
-  const n = await eachSelected(on ? "Adding" : "Removing", (id) =>
+  const n = await eachSelected((id) =>
     api(tvPath(S.tv!, `/photos/${enc(id)}/favorite`), { json: { on } satisfies Toggle }),
   );
-  if (n) toast(`${n} ${n === 1 ? "photo" : "photos"} ${on ? "added to" : "removed from"} favorites`);
+  if (n) toast(`${on ? "Adding" : "Removing"} ${photos(n)} ${on ? "to" : "from"} favorites`);
   endSelection();
-  if (S.filter === "favorites") loadPhotos();
 }
 
 export async function matteSelected(matte: string) {
-  const n = await eachSelected("Changing", async (id) => {
-    await api(tvPath(S.tv!, `/photos/${enc(id)}/matte`), { json: { matte, portrait: null } satisfies MatteUpdate });
-    const p = S.photos?.find((x) => x.id === id);
-    if (p) p.matte = matte;
-  });
-  if (n) toast(`Matte changed on ${n} ${n === 1 ? "photo" : "photos"}`);
+  const n = await eachSelected((id) =>
+    api(tvPath(S.tv!, `/photos/${enc(id)}/matte`), { json: { matte, portrait: null } satisfies MatteUpdate }),
+  );
+  if (n) toast(`Changing the matte on ${photos(n)}`);
 }
 
 export async function deleteSelected() {
   const ids = [...selection.ids];
-  pending.photos = `Deleting ${ids.length}…`;
+  pending.photos = "Saving…";
   await act(async () => {
-    const r = await api<Deleted[]>(tvPath(S.tv!, "/photos/delete"), { json: { ids } satisfies PhotoIds });
-    const gone = new Set(r.map((d) => d.deleted));
-    if (S.photos) S.photos = S.photos.filter((p) => !gone.has(p.id));
-    const moved = r.filter((d) => d.moved_source_to).length;
-    toast(
-      `Deleted ${r.length} ${r.length === 1 ? "photo" : "photos"}` + (moved ? " (originals moved to .removed)" : ""),
-    );
+    await api(tvPath(S.tv!, "/photos/delete"), { json: { ids } satisfies PhotoIds });
+    toast(`Deleting ${photos(ids.length)}`);
     endSelection();
   });
   pending.photos = null;
@@ -426,13 +492,14 @@ export function shareUrl() {
   return `${base}/tv/${enc(S.tv!)}`;
 }
 
-// ── opening dialogs that need the TV's mattes first ──────────────────
-export async function openPhoto(id: string) {
-  if (isAdmin.value) await getMattes();
+// ── dialogs with matte pickers ───────────────────────────────────────
+// The mattes come in meanwhile (the TV may be off, and the server may not have them yet).
+export function openPhoto(id: string) {
+  if (isAdmin.value) getMattes();
   openDialog({ kind: "photo", id });
 }
 
-export async function openTvSettings() {
-  if (curTv.value?.power === "on") await getMattes();
+export function openTvSettings() {
+  getMattes();
   openDialog({ kind: "tvSettings" });
 }

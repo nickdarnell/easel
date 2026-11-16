@@ -2,7 +2,7 @@
 import { ref } from "vue";
 import type { Framing, Photo, Tv } from "./types";
 import { type Frameable, frameDefaults, framingOf, panelAspect, setFromCrop } from "./framing";
-import { S, act, api, curTv, dialog, loadPhotos, loadStatus, openDialog, closeDialog, tvPath } from "./state";
+import { S, act, api, curTv, dialog, openDialog, closeDialog, tvPath } from "./state";
 import { toast } from "./toasts";
 import { enqueue } from "./upload";
 import { enc, errorMessage, isImage } from "./util";
@@ -173,9 +173,7 @@ export async function saveReframe(c: Composer) {
   await act(async () => {
     await api(tvPath(S.tv!, `/photos/${enc(c.photo!.id)}/reframe`), { json: f satisfies Framing });
     closeDialog();
-    toast("Reframed");
-    loadPhotos();
-    setTimeout(loadStatus, 800);
+    toast("Reframing it");
   });
 }
 

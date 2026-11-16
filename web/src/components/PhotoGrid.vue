@@ -6,12 +6,15 @@ import type { Filter, Photo, Tv } from "../types";
 import MatteSelect from "./MatteSelect.vue";
 import {
   S,
+  changesTo,
   deleteSelected,
+  dropChange,
   endSelection,
   favoriteSelected,
   getMattes,
   isAdmin,
   matteSelected,
+  openDialog,
   openPhoto,
   pending,
   selection,
@@ -19,6 +22,9 @@ import {
   thumbUrl,
   brokenThumbs,
   toggleSelected,
+  tvPath,
+  waitingDeletes,
+  waitingUploads,
 } from "../state";
 import { ago } from "../util";
 
@@ -32,6 +38,15 @@ const filters: [Filter, string][] = [
 const list = computed(() => (S.filter === "mine" ? (S.photos ?? []).filter((p) => p.mine) : (S.photos ?? [])));
 const current = computed(() => S.status?.current?.content_id);
 const on = computed(() => props.tv.power === "on");
+/** Why a photo isn't as asked yet, if it isn't: shown on its tile. */
+function unsynced(p: Photo) {
+  const cs = changesTo(p.id);
+  if (!cs.length) return null;
+  if (waitingDeletes.value.has(p.id)) return { text: "Deleting", failed: cs.some((c) => c.state === "failed") };
+  return { text: "Not on the TV yet", failed: cs.some((c) => c.state === "failed") };
+}
+const uploadText = (state: string) =>
+  state === "working" ? "Sending…" : state === "failed" ? "Didn't send" : "Waiting to send";
 const loaded = (e: Event) => (e.target as HTMLImageElement).classList.add("loaded");
 /** Thumbnails the server couldn't get. */
 const broken = brokenThumbs;
@@ -49,7 +64,7 @@ const offlineText = computed(() => {
 let anchor: string | null = null;
 function startSelecting() {
   selection.on = true;
-  if (on.value) getMattes();
+  getMattes();
 }
 function clicked(p: Photo, e: MouseEvent) {
   if (!isAdmin.value || (!selection.on && !e.ctrlKey && !e.metaKey && !e.shiftKey)) {
@@ -87,7 +102,7 @@ const plural = (n: number) => `${n} ${n === 1 ? "photo" : "photos"}`;
 </script>
 
 <template>
-  <section v-if="on || S.photos">
+  <section v-if="on || S.photos || waitingUploads.length">
     <div class="section-head">
       <h2>On this TV</h2>
       <div class="filters">
@@ -99,13 +114,39 @@ const plural = (n: number) => `${n} ${n === 1 ? "photo" : "photos"}`;
     </div>
     <div v-if="S.photosErr" class="notice err">{{ S.photosErr }}</div>
     <div v-else-if="S.photosOffline" class="notice" :title="S.photosOffline.reason">{{ offlineText }}</div>
+    <div v-if="waitingUploads.length && S.filter !== 'favorites'" class="grid waiting-grid">
+      <button
+        v-for="c in waitingUploads"
+        :key="c.id"
+        class="tile waiting"
+        :class="c.state"
+        :title="c.error || c.label"
+        @click="isAdmin && openDialog({ kind: 'queue' })"
+      >
+        <img alt="" :src="tvPath(tv.name, `/queue/${c.id}/preview`)" @load="loaded" />
+        <span class="badges">
+          <span class="badge" :class="c.state === 'failed' ? 'err' : 'pend'"
+            ><span v-if="c.state === 'working'" class="spinner xs"></span>{{ uploadText(c.state) }}</span
+          >
+        </span>
+        <span
+          v-if="isAdmin && c.state !== 'working'"
+          class="tick cancel"
+          role="button"
+          aria-label="Don't send it"
+          title="Don't send it"
+          @click.stop="dropChange(c.id)"
+          >×</span
+        >
+      </button>
+    </div>
     <div v-if="!S.photos && !S.photosErr" class="grid"><div v-for="n in 8" :key="n" class="tile"></div></div>
     <div v-else-if="list.length" class="grid" :class="{ selecting: selection.on }">
       <button
         v-for="p in list"
         :key="p.id"
         class="tile"
-        :class="{ current: p.id === current, selected: selection.ids.has(p.id) }"
+        :class="{ current: p.id === current, selected: selection.ids.has(p.id), leaving: waitingDeletes.has(p.id) }"
         :title="p.source || p.id"
         @click="clicked(p, $event)"
       >
@@ -122,6 +163,9 @@ const plural = (n: number) => `${n} ${n === 1 ? "photo" : "photos"}`;
         <span class="badges">
           <span v-if="p.id === current" class="badge gold">On now</span>
           <span v-if="p.mine" class="badge">Added here</span>
+          <span v-if="unsynced(p)" class="badge" :class="unsynced(p)!.failed ? 'err' : 'pend'">{{
+            unsynced(p)!.text
+          }}</span>
         </span>
         <span v-if="selection.on" class="tick" aria-hidden="true">{{ selection.ids.has(p.id) ? "✓" : "" }}</span>
       </button>
@@ -139,7 +183,7 @@ const plural = (n: number) => `${n} ${n === 1 ? "photo" : "photos"}`;
         <button class="ghost" @click="endSelection">Done</button>
       </div>
       <div v-if="pending.photos" class="row muted"><span class="spinner sm"></span>{{ pending.photos }}</div>
-      <div v-else-if="count && on" class="row wrap">
+      <div v-else-if="count" class="row wrap">
         <button @click="favoriteSelected(S.filter !== 'favorites')">
           {{ S.filter === "favorites" ? "Remove from favorites" : "Add to favorites" }}
         </button>
@@ -153,7 +197,9 @@ const plural = (n: number) => `${n} ${n === 1 ? "photo" : "photos"}`;
           {{ armed ? `Really delete ${plural(count)}?` : "Delete" }}
         </button>
       </div>
-      <div v-else-if="count" class="row muted small">Turn the TV on to change these photos.</div>
+      <div v-if="count && !on" class="row muted small">
+        {{ tv.name }} is {{ tv.power === "standby" ? "asleep" : "off" }}: changes are made when it's next on.
+      </div>
     </div>
   </section>
 </template>

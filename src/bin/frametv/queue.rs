@@ -94,6 +94,15 @@ impl Queue {
         self.inner.lock().unwrap().waiting.len()
     }
 
+    /// How many are waiting at each priority.
+    pub fn waiting_by(&self) -> [u32; 3] {
+        let mut n = [0u32; 3];
+        for (prio, _) in self.inner.lock().unwrap().waiting.keys() {
+            n[*prio as usize] += 1;
+        }
+        n
+    }
+
     fn pass_on(&self) {
         let mut q = self.inner.lock().unwrap();
         while let Some((_, tx)) = q.waiting.pop_first() {

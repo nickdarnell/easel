@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { computed, ref } from "vue";
 import ModalDialog from "./ModalDialog.vue";
 import MatteSelect from "./MatteSelect.vue";
 import { S, act, api, closeDialog, curTv, loadTvs, tvPath } from "../state";
@@ -19,13 +19,13 @@ const matte = ref(tv.matte || "auto");
 const portrait = ref(tv.portrait_matte || "shadowbox_polar");
 const syncDelete = ref(false);
 const forgetArmed = ref(false);
-// Mattes are only offered when the TV could list them (it's on).
-const mattes = S.mattes;
+// Mattes are only offered once the TV has listed them (they arrive after the dialog opens).
+const mattes = computed(() => S.mattes);
 
 const save = () =>
   act(async () => {
     const body: TvUpdate = { fit: fit.value, folder: folder.value };
-    if (mattes) {
+    if (mattes.value) {
       body.matte = matte.value;
       body.portrait_matte = portrait.value;
     }

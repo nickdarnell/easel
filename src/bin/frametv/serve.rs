@@ -27,16 +27,18 @@ use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio::sync::{Mutex, Notify, broadcast, mpsc};
 
 use samsung_frame::art::{ArtClient, ArtItem, MatteList, UploadOptions};
 use samsung_frame::config::{Config, TvConfig};
 use samsung_frame::protocol::category;
+use samsung_frame::remote::RemoteClient;
 use samsung_frame::sync::{self, Framing, TvState};
 use samsung_frame::{discovery, image_prep, localsend, pairing, rest, wol};
 
 use crate::api::{self, ServerEvent};
 use crate::cache::{self, Snapshot};
+use crate::outbox::{Change, Dropped, Op, Outbox};
 use crate::queue::{Prio, Queue};
 
 // The web UI (`web/`), embedded by build.rs.
@@ -82,6 +84,20 @@ const RECOVERY_ROUNDS: u32 = 3;
 /// Some TVs say they're in standby while showing art: if the art app answered this recently,
 /// the TV counts as on.
 const ANSWERED_RECENTLY: Duration = Duration::from_secs(90);
+/// A remote connection unused for this long is replaced before the next button press (the TV
+/// may have quietly dropped it).
+const REMOTE_IDLE: Duration = Duration::from_secs(60);
+/// The longest a remote button can be held down.
+const LONGEST_HOLD: Duration = Duration::from_secs(10);
+/// How often the TV may turn a change down (an error answer) before it's left for someone to
+/// look at: it sometimes says no while it's busy.
+const REJECTIONS_BEFORE_FAILING: u32 = 3;
+
+tokio::task_local! {
+    /// Set while retrying a waiting change by itself: the TV isn't woken or restarted for it,
+    /// it only goes ahead if the TV answers.
+    static GENTLE: bool;
+}
 
 pub struct ServeOptions {
     pub bind: IpAddr,
@@ -123,6 +139,12 @@ struct Tv {
     last_restart: StdMutex<Option<Instant>>,
     /// When the art app last answered.
     answered: StdMutex<Option<Instant>>,
+    /// Changes waiting to be made (loaded from disk on first use).
+    outbox: StdMutex<Option<Outbox>>,
+    /// Wakes the worker making the changes: try now.
+    kick: Notify,
+    /// The remote control connection, and when it was last used.
+    remote: Mutex<Option<(RemoteClient, Instant)>>,
 }
 
 /// A shared, detached attempt at getting a TV to answer (see [`Hub::recover`]).
@@ -159,6 +181,9 @@ impl Tv {
             recovery: StdMutex::new(None),
             last_restart: StdMutex::new(None),
             answered: StdMutex::new(None),
+            outbox: StdMutex::new(None),
+            kick: Notify::new(),
+            remote: Mutex::new(None),
         })
     }
 
@@ -201,6 +226,25 @@ impl Tv {
     fn recovering(&self) -> bool {
         self.recovery.lock().unwrap().is_some()
             || self.activity.lock().unwrap().as_ref().is_some_and(|a| a.kind != api::ActivityKind::Waiting)
+    }
+
+    /// The TV is answering again: changes waiting for it are tried now.
+    fn poke(&self) {
+        let any = self.outbox.lock().unwrap().as_mut().is_some_and(Outbox::wake_up);
+        if any {
+            self.kick.notify_one();
+        }
+    }
+
+    /// What the TV is being asked right now, and for how long, if anything.
+    fn asking(&self) -> Option<api::Asking> {
+        let art = self.art.try_lock().ok()?.as_ref().map(Arc::clone)?;
+        let (request, waited) = art.waiting_on()?;
+        Some(api::Asking {
+            label: request_label(&request),
+            request,
+            ms: u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+        })
     }
 
     /// How long ago the TV last said what it's showing.
@@ -613,6 +657,7 @@ impl Hub {
         if was.is_some_and(|p| p != api::Power::On) {
             self.emit(ServerEvent::TvsChanged);
         }
+        tv.poke();
     }
 
     /// Run `f` against the TV (whoever calls this holds a turn at `prio`).
@@ -620,17 +665,19 @@ impl Hub {
     /// Requests wait rather than fail when the TV is slow or stuck: a dropped connection is
     /// replaced, and if the TV doesn't answer, the server gets it to (see [`Self::recover`])
     /// and asks again. Background upkeep doesn't wait for that, nor does a read whose page has
-    /// been closed; anything else gives up after [`RECOVERY_ROUNDS`] failed attempts.
+    /// been closed, nor a change being retried by itself (see [`GENTLE`]); anything else gives
+    /// up after [`RECOVERY_ROUNDS`] failed attempts.
     async fn call<T, F, Fut>(self: &Arc<Self>, tv: &Arc<Tv>, prio: Prio, f: F) -> anyhow::Result<T>
     where
         F: Fn(Arc<ArtClient>) -> Fut,
         Fut: Future<Output = samsung_frame::Result<T>>,
     {
         let (mut rounds, mut reconnected, mut was_fine) = (0, false, false);
+        let gentle = GENTLE.try_with(|g| *g).unwrap_or(false);
         loop {
             let pending = tv.recovery.lock().unwrap().clone();
             if let Some(recovery) = pending {
-                if prio == Prio::Background {
+                if prio == Prio::Background || gentle {
                     return Err(anyhow!("{} isn't answering yet", tv.name));
                 }
                 recovery.await;
@@ -652,11 +699,12 @@ impl Hub {
                 },
                 Err(e) => e,
             };
-            let give_up = match prio {
-                Prio::Background => true,
-                Prio::Read => !tv.watched() || rounds >= RECOVERY_ROUNDS,
-                Prio::Command => rounds >= RECOVERY_ROUNDS,
-            };
+            let give_up = gentle
+                || match prio {
+                    Prio::Background => true,
+                    Prio::Read => !tv.watched() || rounds >= RECOVERY_ROUNDS,
+                    Prio::Command => rounds >= RECOVERY_ROUNDS,
+                };
             if give_up {
                 return Err(failure);
             }
@@ -701,7 +749,11 @@ impl Hub {
         }
         let mut shown = None;
         if tv.activity.lock().unwrap().is_none() {
-            self.set_activity(tv, Some((api::ActivityKind::Waiting, format!("Waiting for {} to answer…", tv.name))));
+            let message = match tv.asking() {
+                Some(a) => format!("Waiting for {} to answer ({})…", tv.name, a.label.to_lowercase()),
+                None => format!("Waiting for {} to answer…", tv.name),
+            };
+            self.set_activity(tv, Some((api::ActivityKind::Waiting, message)));
             shown = Some(Shown(self, tv));
         }
         let r = fut.await;
@@ -834,7 +886,7 @@ impl Hub {
         let client_name = self.cfg.lock().unwrap().client_name.clone();
         let endpoint = cfg.endpoint(&client_name);
         let held = tokio::time::timeout(CONNECT_TIMEOUT + Duration::from_secs(10), async {
-            let mut remote = samsung_frame::remote::RemoteClient::connect(&endpoint).await?;
+            let mut remote = RemoteClient::connect(&endpoint).await?;
             remote.hold("KEY_POWER", Duration::from_secs(4)).await?;
             remote.close().await;
             Ok::<(), samsung_frame::Error>(())
@@ -956,6 +1008,7 @@ impl Hub {
                 // It may have been off for a while.
                 self.refresh_status(tv, Prio::Background);
                 self.refresh_photos(tv, category::MY_PHOTOS);
+                tv.poke();
             }
             if before.is_some() {
                 self.emit(ServerEvent::TvsChanged);
@@ -1147,26 +1200,40 @@ impl Hub {
         Ok(())
     }
 
-    /// Save an incoming photo next to the TV's synced photos (or under `photos/<tv>`), upload
-    /// it unless it is already there with the same framing, and optionally display it.
-    async fn ingest(
+    /// Save an incoming photo next to the TV's synced photos (or under `photos/<tv>`), and
+    /// queue it to be sent (and shown, if `show`) whenever the TV answers. Returns the change.
+    fn ingest(
         self: &Arc<Self>,
         tv: &Arc<Tv>,
         file_name: &str,
         data: &[u8],
         show: bool,
         framing: Option<Framing>,
-    ) -> anyhow::Result<api::Uploaded> {
+    ) -> anyhow::Result<u64> {
         let cfg = tv.config();
         let dir = cfg.folder.clone().unwrap_or_else(|| self.data_dir.join("photos").join(&tv.name));
         let hash = hex::encode(Sha256::digest(data));
-        let path = save_unique(&dir, &localsend::sanitize_file_name(file_name), data, &hash)?;
+        let (path, fresh) = save_unique(&dir, &localsend::sanitize_file_name(file_name), data, &hash)?;
+        Ok(self.enqueue(tv, Op::Upload { name: file_name.to_owned(), path, hash, framing, show, fresh }))
+    }
 
+    /// Send a saved photo to the TV unless it is already there with the same framing, and
+    /// optionally display it.
+    async fn send_photo(
+        self: &Arc<Self>,
+        tv: &Arc<Tv>,
+        file_name: &str,
+        path: &Path,
+        hash: &str,
+        show: bool,
+        framing: Option<Framing>,
+    ) -> anyhow::Result<api::Uploaded> {
+        let cfg = tv.config();
         let _guard = tv.xfer.lock().await;
         let state_file = self.state_file(tv);
         let mut state = TvState::load(&state_file)?;
         // Only ask the TV for its photos if this exact file was sent before.
-        let existing = match state.content_for_hash(&hash).map(str::to_owned) {
+        let existing = match state.content_for_hash(hash).map(str::to_owned) {
             Some(id) => {
                 let on_tv = self
                     .read_art(tv, Prio::Command, |a| async move { a.content_list(Some(category::MY_PHOTOS)).await })
@@ -1187,8 +1254,8 @@ impl Hub {
             if let Some(f) = &framing {
                 f.apply(&mut settings);
             }
-            let result = self.upload_with_retry(tv, &path, &settings).await?;
-            state.record_framed(&result.content_id, &hash, &path, framing.clone());
+            let result = self.upload_with_retry(tv, path, &settings).await?;
+            state.record_framed(&result.content_id, hash, path, framing.clone());
             // Re-sent with different framing: the new version replaces the old one.
             if let Some(old) = existing {
                 state.uploads.remove(&old);
@@ -1199,6 +1266,8 @@ impl Hub {
             state.save(&state_file)?;
             (result.content_id, false)
         };
+        // Sent, even if showing it fails: trying again then finds it already there.
+        tv.photos_changed();
         if show {
             let id = content_id.clone();
             self.with_art(tv, |a| {
@@ -1209,9 +1278,193 @@ impl Hub {
             self.status_changed(tv);
         }
         let photo = api::Uploaded { content_id, name: file_name.to_owned(), duplicate, shown: show };
-        tv.photos_changed();
         self.emit(ServerEvent::Uploaded { tv: tv.name.clone(), photo: photo.clone() });
         Ok(photo)
+    }
+
+    /// Do `f` with the TV's waiting changes (loaded from disk the first time).
+    fn with_outbox<T>(&self, tv: &Tv, f: impl FnOnce(&mut Outbox) -> T) -> T {
+        let mut slot = tv.outbox.lock().unwrap();
+        let ob = slot.get_or_insert_with(|| Outbox::load(&self.outbox_file(tv)));
+        f(ob)
+    }
+
+    fn outbox_file(&self, tv: &Tv) -> PathBuf {
+        sync::state_path(&self.data_dir.join("pending"), &tv.name)
+    }
+
+    /// Everything the server is waiting on for the TV. `asking`: include what the TV is being
+    /// asked right now (left out of events, which aren't sent every time that changes).
+    fn tv_queue(&self, tv: &Tv, asking: bool) -> api::TvQueue {
+        let [commands, reads, background] = tv.queue.waiting_by();
+        api::TvQueue {
+            changes: self.with_outbox(tv, |ob| ob.to_api()),
+            asking: if asking { tv.asking() } else { None },
+            waiting: api::Waiting { commands, reads, background },
+            activity: tv.activity.lock().unwrap().clone(),
+        }
+    }
+
+    /// Tell the pages the TV's waiting changes changed.
+    fn queue_changed(&self, tv: &Tv) {
+        self.emit(ServerEvent::Queue { tv: tv.name.clone(), queue: self.tv_queue(tv, false) });
+    }
+
+    /// Write down a change to make on the TV, and get on with it (trying now, waking the TV if
+    /// need be). Returns its id.
+    fn enqueue(self: &Arc<Self>, tv: &Arc<Tv>, op: Op) -> u64 {
+        let (id, dropped) = self.with_outbox(tv, |ob| {
+            let pushed = ob.push(op);
+            ob.wake_up();
+            pushed
+        });
+        self.tidy(tv, &dropped);
+        self.queue_changed(tv);
+        tv.kick.notify_one();
+        self.pump_outbox(tv);
+        id
+    }
+
+    /// Remove what was saved only for changes that won't be made.
+    fn tidy(&self, tv: &Tv, dropped: &[Dropped]) {
+        self.with_outbox(tv, |ob| ob.tidy(dropped));
+    }
+
+    /// Make the TV's waiting changes in the background, one at a time, oldest first.
+    fn pump_outbox(self: &Arc<Self>, tv: &Arc<Tv>) {
+        let (hub, t) = (Arc::clone(self), Arc::clone(tv));
+        tv.coalesce("outbox", move || {
+            let (hub, tv) = (Arc::clone(&hub), Arc::clone(&t));
+            async move { hub.run_outbox(&tv).await }
+        });
+    }
+
+    /// Until there's nothing left to do (or only changes the TV turned down): make the next
+    /// change, or wait until it's time to try again, or until kicked.
+    async fn run_outbox(self: &Arc<Self>, tv: &Arc<Tv>) {
+        loop {
+            if !self.all_tvs().iter().any(|t| Arc::ptr_eq(t, tv)) {
+                return; // forgotten
+            }
+            let change = match self.with_outbox(tv, |ob| ob.take_next(false)) {
+                Ok(c) => c,
+                Err(None) => return,
+                Err(Some(wait)) => {
+                    tokio::select! {
+                        () = tokio::time::sleep(wait) => {}
+                        () = tv.kick.notified() => {}
+                    }
+                    continue;
+                }
+            };
+            self.queue_changed(tv);
+            // Retrying by itself: only if the TV answers (it isn't woken for it).
+            let outcome = if !change.eager && self.check_power(tv).await == api::Power::Off {
+                Outcome::Later(format!("{} is off", tv.name))
+            } else {
+                GENTLE.scope(!change.eager, self.apply(tv, &change)).await
+            };
+            let (id, what) = (change.id, change.op.describe());
+            match outcome {
+                Outcome::Done => self.with_outbox(tv, |ob| ob.done(id)),
+                Outcome::Later(why) => {
+                    tracing::info!("{}: {what}: {why}; trying again later", tv.name);
+                    self.with_outbox(tv, |ob| ob.later(id, why));
+                }
+                Outcome::Failed(why) => {
+                    tracing::warn!("{}: {what}: {why}", tv.name);
+                    self.emit(ServerEvent::Error { tv: tv.name.clone(), message: format!("{what}: {why}") });
+                    self.with_outbox(tv, |ob| ob.failed(id, why));
+                }
+            }
+            self.queue_changed(tv);
+        }
+    }
+
+    /// Make one change on the TV.
+    async fn apply(self: &Arc<Self>, tv: &Arc<Tv>, change: &Change) -> Outcome {
+        let result: anyhow::Result<()> = match change.op.clone() {
+            Op::Upload { name, path, hash, framing, show, .. } => {
+                if !path.is_file() {
+                    return Outcome::Failed(format!("the photo ({}) is gone from the server", path.display()));
+                }
+                self.send_photo(tv, &name, &path, &hash, show, framing).await.map(drop)
+            }
+            Op::Delete { ids } => delete_photos(self, tv, ids.clone()).await.map(|_| {
+                let dropped = self.with_outbox(tv, |ob| ob.forget(&ids));
+                self.tidy(tv, &dropped);
+            }),
+            Op::Matte { id, matte, portrait } => self
+                .with_art(tv, |a| {
+                    let (id, matte, portrait) = (id.clone(), matte.clone(), portrait.clone());
+                    async move { a.change_matte(&id, &matte, portrait.as_deref()).await }
+                })
+                .await
+                .map(|()| self.changed(tv)),
+            Op::Favorite { id, on } => self
+                .with_art(tv, |a| {
+                    let id = id.clone();
+                    async move { a.set_favorite(&id, on).await }
+                })
+                .await
+                .map(|()| self.changed(tv)),
+            Op::Slideshow { minutes, shuffle, favorites } => {
+                let cat = if favorites { category::FAVORITES } else { category::MY_PHOTOS };
+                let minutes = minutes.filter(|m| *m > 0);
+                self.with_art(tv, |a| async move { a.set_slideshow(minutes, shuffle, cat).await })
+                    .await
+                    .map(|()| self.status_changed(tv))
+            }
+            Op::Reframe { id, framing } => match reframe_photo(Arc::clone(self), Arc::clone(tv), id, framing).await {
+                Ok(r) => {
+                    self.with_outbox(tv, |ob| ob.renamed(&r.replaced, &r.content_id));
+                    Ok(())
+                }
+                Err(ApiError(StatusCode::NOT_FOUND, e)) => return Outcome::Failed(format!("{e:#}")),
+                Err(ApiError(_, e)) => Err(e),
+            },
+        };
+        match result {
+            Ok(()) => Outcome::Done,
+            Err(e) => judge(change, &e),
+        }
+    }
+
+    /// Press a button on the TV's remote (holding it down for `hold`), straight away. The
+    /// connection is kept for the next press.
+    async fn press(&self, tv: &Tv, key: &str, hold: Option<Duration>) -> anyhow::Result<()> {
+        let mut slot = tv.remote.lock().await;
+        let mut retried = false;
+        loop {
+            if slot.as_ref().is_none_or(|(_, used)| used.elapsed() >= REMOTE_IDLE) {
+                if let Some((old, _)) = slot.take() {
+                    old.close().await;
+                }
+                let endpoint = tv.config().endpoint(&self.cfg.lock().unwrap().client_name.clone());
+                let remote = tokio::time::timeout(CONNECT_TIMEOUT, RemoteClient::connect(&endpoint))
+                    .await
+                    .map_err(|_| anyhow!("{} did not answer (is it on?)", tv.name))??;
+                *slot = Some((remote, Instant::now()));
+            }
+            let Some((remote, used)) = slot.as_mut() else { unreachable!() };
+            let pressed = match hold {
+                Some(d) => remote.hold(key, d).await,
+                None => remote.click(key).await,
+            };
+            match pressed {
+                Ok(()) => {
+                    *used = Instant::now();
+                    return Ok(());
+                }
+                // The TV dropped the connection: once more on a new one.
+                Err(e) if !retried => {
+                    tracing::info!("{}: remote: {e}; reconnecting", tv.name);
+                    slot.take();
+                    retried = true;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
     }
 
     /// (Re)start the LocalSend targets to match the current settings and TVs.
@@ -1238,8 +1491,8 @@ impl Hub {
 }
 
 /// Write `data` into `dir` as `name`, adding ` (2)` etc. on collisions, unless an identical
-/// file is already there.
-fn save_unique(dir: &Path, name: &str, data: &[u8], hash: &str) -> anyhow::Result<PathBuf> {
+/// file is already there. `true` with the path if it was written now.
+fn save_unique(dir: &Path, name: &str, data: &[u8], hash: &str) -> anyhow::Result<(PathBuf, bool)> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let stem = Path::new(name).file_stem().and_then(|s| s.to_str()).unwrap_or("image").to_string();
     let ext = Path::new(name).extension().and_then(|s| s.to_str()).map(|e| format!(".{e}")).unwrap_or_default();
@@ -1247,14 +1500,59 @@ fn save_unique(dir: &Path, name: &str, data: &[u8], hash: &str) -> anyhow::Resul
         let candidate = if n == 1 { dir.join(name) } else { dir.join(format!("{stem} ({n}){ext}")) };
         if candidate.exists() {
             if sync::hash_file(&candidate).is_ok_and(|h| h == hash) {
-                return Ok(candidate);
+                return Ok((candidate, false));
             }
             continue;
         }
         std::fs::write(&candidate, data)?;
-        return Ok(candidate);
+        return Ok((candidate, true));
     }
     Err(anyhow!("too many files named {name}"))
+}
+
+/// How an attempt at a waiting change went.
+enum Outcome {
+    Done,
+    /// The TV didn't answer (or said no while busy): try again later.
+    Later(String),
+    /// The TV turned it down: leave it for someone to retry or drop.
+    Failed(String),
+}
+
+/// Whether a change that failed with `e` is worth trying again by itself.
+fn judge(change: &Change, e: &anyhow::Error) -> Outcome {
+    use samsung_frame::Error as E;
+    let why = format!("{e:#}");
+    match e.downcast_ref::<E>() {
+        Some(E::Art { .. }) if change.attempts < REJECTIONS_BEFORE_FAILING => Outcome::Later(why),
+        Some(E::Art { .. } | E::Image(_) | E::Unauthorized | E::ChannelTimeout) => Outcome::Failed(why),
+        _ => Outcome::Later(why),
+    }
+}
+
+/// Says what an art app request is for, e.g. "Getting the photo list" for `get_content_list`.
+fn request_label(request: &str) -> String {
+    let label = match request {
+        "get_content_list" => "Getting the photo list",
+        "get_thumbnail" | "get_thumbnail_list" => "Getting photo previews",
+        "get_current_artwork" => "Asking what's on screen",
+        "get_artmode_status" => "Asking whether art mode is on",
+        "set_artmode_status" => "Turning art mode on or off",
+        "get_slideshow_status" | "get_auto_rotation_status" => "Asking about the slideshow",
+        "set_slideshow_status" | "set_auto_rotation_status" => "Setting the slideshow",
+        "send_image" => "Sending a photo",
+        "delete_image_list" => "Deleting photos",
+        "change_matte" => "Changing a matte",
+        "select_image" => "Putting a photo on screen",
+        "change_favorite" => "Changing a favorite",
+        "get_matte_list" => "Getting the mattes",
+        "get_photo_filter_list" | "set_photo_filter" => "Photo filters",
+        "get_api_version" | "api_version" => "Checking that it answers",
+        "get_device_info" => "Getting device details",
+        "get_artmode_settings" => "Getting art mode settings",
+        other => return other.replace('_', " "),
+    };
+    label.to_string()
 }
 
 pub async fn run(cfg: Config, cfg_path: PathBuf, state_dir: PathBuf, opts: ServeOptions) -> anyhow::Result<()> {
@@ -1274,6 +1572,11 @@ pub async fn run(cfg: Config, cfg_path: PathBuf, state_dir: PathBuf, opts: Serve
         localsend_task: Mutex::new(None),
     });
     hub.restart_localsend().await;
+    for tv in hub.all_tvs() {
+        if !hub.with_outbox(&tv, |ob| ob.is_empty()) {
+            hub.pump_outbox(&tv);
+        }
+    }
 
     let app = Router::new()
         .route("/", get(index))
@@ -1305,6 +1608,10 @@ pub async fn run(cfg: Config, cfg_path: PathBuf, state_dir: PathBuf, opts: Serve
         .route("/api/tvs/{tv}/sync", post(sync_folder))
         .route("/api/tvs/{tv}/wake", post(wake))
         .route("/api/tvs/{tv}/share-card", post(share_card).delete(end_share))
+        .route("/api/tvs/{tv}/queue", get(get_queue))
+        .route("/api/tvs/{tv}/queue/{id}", post(retry_change).delete(drop_change))
+        .route("/api/tvs/{tv}/queue/{id}/preview", get(change_preview))
+        .route("/api/tvs/{tv}/key", post(press_key))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD))
         .with_state(Arc::clone(&hub));
 
@@ -1390,19 +1697,11 @@ async fn start_localsend(hub: &Shared, pin: Option<String>) -> anyhow::Result<lo
             let show = hub.server_settings().show_on_receive;
             tracing::info!("received {} from {} via LocalSend", file.file_name, file.sender_alias);
             for tv in tvs {
-                let (hub, tv, file_name, data) =
-                    (Arc::clone(&hub), Arc::clone(tv), file.file_name.clone(), file.data.clone());
                 let show = show && file.last_in_session;
-                let from = file.sender_alias.clone();
-                // TVs work in parallel; each TV's transfers are serialized by its own lock.
-                tokio::spawn(async move {
-                    if let Err(e) = hub.ingest(&tv, &file_name, &data, show, None).await {
-                        hub.emit(ServerEvent::Error {
-                            tv: tv.name.clone(),
-                            message: format!("{file_name} from {from}: {e:#}"),
-                        });
-                    }
-                });
+                if let Err(e) = hub.ingest(tv, &file.file_name, &file.data, show, None) {
+                    let message = format!("{} from {}: {e:#}", file.file_name, file.sender_alias);
+                    hub.emit(ServerEvent::Error { tv: tv.name.clone(), message });
+                }
             }
         }
     });
@@ -1740,6 +2039,8 @@ async fn forget_tv(
     hub.require_admin(&headers)?;
     let tv = hub.tv(&name)?;
     hub.tvs.write().unwrap().retain(|t| !Arc::ptr_eq(t, &tv));
+    tv.kick.notify_one();
+    let _ = std::fs::remove_file(hub.outbox_file(&tv));
     if let Some(art) = tv.art.lock().await.take()
         && let Ok(art) = Arc::try_unwrap(art)
     {
@@ -2053,13 +2354,21 @@ impl UploadQuery {
     }
 }
 
-/// Anyone may send photos. The body is the raw file; `?name=` is its file name.
+/// A change written down, to be made whenever the TV answers.
+type QueuedReply = (StatusCode, Json<api::Queued>);
+
+fn queued(change: u64) -> QueuedReply {
+    (StatusCode::ACCEPTED, Json(api::Queued { change }))
+}
+
+/// Anyone may send photos. The body is the raw file; `?name=` is its file name. It's saved,
+/// and sent to the TV whenever it answers.
 async fn upload(
     State(hub): State<Shared>,
     UrlPath(name): UrlPath<String>,
     Query(q): Query<UploadQuery>,
     body: Bytes,
-) -> ApiResult<Json<api::Uploaded>> {
+) -> ApiResult<QueuedReply> {
     let tv = hub.tv(&name)?;
     if body.is_empty() {
         return Err(status_err(StatusCode::BAD_REQUEST, "empty upload"));
@@ -2067,16 +2376,8 @@ async fn upload(
     let framing = q.framing()?;
     let file_name = q.name.unwrap_or_else(|| format!("photo-{}.jpg", chrono::Local::now().format("%Y%m%d-%H%M%S")));
     let show = q.show.unwrap_or(false);
-    detach(async move {
-        match hub.ingest(&tv, &file_name, &body, show, framing).await {
-            Ok(v) => Ok(Json(v)),
-            Err(e) => {
-                hub.emit(ServerEvent::Error { tv: tv.name.clone(), message: format!("{file_name}: {e:#}") });
-                Err(e.into())
-            }
-        }
-    })
-    .await
+    let change = tokio::task::spawn_blocking(move || hub.ingest(&tv, &file_name, &body, show, framing)).await??;
+    Ok(queued(change))
 }
 
 async fn show(
@@ -2103,19 +2404,10 @@ async fn set_matte(
     headers: HeaderMap,
     UrlPath((name, id)): UrlPath<(String, String)>,
     Json(b): Json<api::MatteUpdate>,
-) -> ApiResult<StatusCode> {
+) -> ApiResult<QueuedReply> {
     hub.require_admin(&headers)?;
     let tv = hub.tv(&name)?;
-    detach(async move {
-        hub.with_art(&tv, |a| {
-            let (id, matte, portrait) = (id.clone(), b.matte.clone(), b.portrait.clone());
-            async move { a.change_matte(&id, &matte, portrait.as_deref()).await }
-        })
-        .await?;
-        hub.changed(&tv);
-        Ok(StatusCode::NO_CONTENT)
-    })
-    .await
+    Ok(queued(hub.enqueue(&tv, Op::Matte { id, matte: b.matte, portrait: b.portrait })))
 }
 
 async fn favorite(
@@ -2123,19 +2415,10 @@ async fn favorite(
     headers: HeaderMap,
     UrlPath((name, id)): UrlPath<(String, String)>,
     Json(b): Json<api::Toggle>,
-) -> ApiResult<StatusCode> {
+) -> ApiResult<QueuedReply> {
     hub.require_admin(&headers)?;
     let tv = hub.tv(&name)?;
-    detach(async move {
-        hub.with_art(&tv, |a| {
-            let id = id.clone();
-            async move { a.set_favorite(&id, b.on).await }
-        })
-        .await?;
-        hub.changed(&tv);
-        Ok(StatusCode::NO_CONTENT)
-    })
-    .await
+    Ok(queued(hub.enqueue(&tv, Op::Favorite { id, on: b.on })))
 }
 
 /// The original photo behind one of our uploads, as a JPEG preview for the framing editor.
@@ -2164,13 +2447,17 @@ async fn reframe(
     headers: HeaderMap,
     UrlPath((name, id)): UrlPath<(String, String)>,
     Json(framing): Json<Framing>,
-) -> ApiResult<Json<api::Reframed>> {
+) -> ApiResult<QueuedReply> {
     hub.require_admin(&headers)?;
     let tv = hub.tv(&name)?;
-    detach(reframe_photo(hub, tv, id, framing)).await
+    let state = TvState::load(&hub.state_file(&tv))?;
+    if !state.uploads.contains_key(&id) {
+        return Err(status_err(StatusCode::NOT_FOUND, "only photos sent from here can be reframed"));
+    }
+    Ok(queued(hub.enqueue(&tv, Op::Reframe { id, framing })))
 }
 
-async fn reframe_photo(hub: Shared, tv: Arc<Tv>, id: String, framing: Framing) -> ApiResult<Json<api::Reframed>> {
+async fn reframe_photo(hub: Shared, tv: Arc<Tv>, id: String, framing: Framing) -> ApiResult<api::Reframed> {
     let _guard = tv.xfer.lock().await;
     let state_file = hub.state_file(&tv);
     let mut state = TvState::load(&state_file)?;
@@ -2206,7 +2493,7 @@ async fn reframe_photo(hub: Shared, tv: Arc<Tv>, id: String, framing: Framing) -
     }
     tv.forget_photos(std::slice::from_ref(&id));
     hub.changed(&tv);
-    Ok(Json(api::Reframed { content_id: result.content_id, replaced: id, matte: result.matte }))
+    Ok(api::Reframed { content_id: result.content_id, replaced: id, matte: result.matte })
 }
 
 /// Delete from the TV. If the photo came from the TV's sync folder, its file is moved to
@@ -2215,10 +2502,10 @@ async fn delete_photo(
     State(hub): State<Shared>,
     headers: HeaderMap,
     UrlPath((name, id)): UrlPath<(String, String)>,
-) -> ApiResult<Json<api::Deleted>> {
+) -> ApiResult<QueuedReply> {
     hub.require_admin(&headers)?;
     let tv = hub.tv(&name)?;
-    detach(async move { Ok(Json(delete_photos(&hub, &tv, vec![id]).await?.remove(0))) }).await
+    Ok(queued(hub.enqueue(&tv, Op::Delete { ids: vec![id] })))
 }
 
 /// `POST /api/tvs/{tv}/photos/delete` (admin): delete several photos at once.
@@ -2227,19 +2514,36 @@ async fn delete_many(
     headers: HeaderMap,
     UrlPath(name): UrlPath<String>,
     Json(b): Json<api::PhotoIds>,
-) -> ApiResult<Json<Vec<api::Deleted>>> {
+) -> ApiResult<QueuedReply> {
     hub.require_admin(&headers)?;
     let tv = hub.tv(&name)?;
     if b.ids.is_empty() {
-        return Ok(Json(vec![]));
+        return Err(status_err(StatusCode::BAD_REQUEST, "no photos to delete"));
     }
-    detach(async move { Ok(Json(delete_photos(&hub, &tv, b.ids).await?)) }).await
+    Ok(queued(hub.enqueue(&tv, Op::Delete { ids: b.ids })))
 }
 
 /// Delete photos from the TV. Originals that came from the TV's sync folder are moved aside, to
 /// `.removed`, so the next sync doesn't put them back.
 async fn delete_photos(hub: &Shared, tv: &Arc<Tv>, ids: Vec<String>) -> anyhow::Result<Vec<api::Deleted>> {
-    hub.delete_from_tv(tv, ids.clone()).await?;
+    if let Err(e) = hub.delete_from_tv(tv, ids.clone()).await {
+        // The TV says no if some are gone already (deleted on the TV, or by an earlier try
+        // that didn't hear back): fine, if they all are.
+        let refused = matches!(e.downcast_ref::<samsung_frame::Error>(), Some(samsung_frame::Error::Art { .. }));
+        let gone = refused
+            && hub
+                .read_art(tv, Prio::Command, |a| async move { a.content_list(Some(category::MY_PHOTOS)).await })
+                .await
+                .is_ok_and(|on_tv| !on_tv.iter().any(|i| ids.contains(&i.content_id)));
+        if !gone {
+            return Err(e);
+        }
+        for id in &ids {
+            if let Some(p) = find_thumb(&hub.thumb_dir(tv), id) {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
     tv.forget_photos(&ids);
     let state_file = hub.state_file(tv);
     let mut state = TvState::load(&state_file)?;
@@ -2315,15 +2619,103 @@ async fn slideshow(
     headers: HeaderMap,
     UrlPath(name): UrlPath<String>,
     Json(b): Json<api::SlideshowUpdate>,
+) -> ApiResult<QueuedReply> {
+    hub.require_admin(&headers)?;
+    let tv = hub.tv(&name)?;
+    let op = Op::Slideshow {
+        minutes: b.minutes.filter(|m| *m > 0),
+        shuffle: b.shuffle.unwrap_or(true),
+        favorites: b.favorites.unwrap_or(false),
+    };
+    Ok(queued(hub.enqueue(&tv, op)))
+}
+
+/// `GET /api/tvs/{tv}/queue`: what the server is waiting on for the TV.
+async fn get_queue(State(hub): State<Shared>, UrlPath(name): UrlPath<String>) -> ApiResult<Json<api::TvQueue>> {
+    let tv = hub.tv(&name)?;
+    Ok(Json(hub.tv_queue(&tv, true)))
+}
+
+/// `POST /api/tvs/{tv}/queue/{id}` (admin): try a waiting change again now.
+async fn retry_change(
+    State(hub): State<Shared>,
+    headers: HeaderMap,
+    UrlPath((name, id)): UrlPath<(String, u64)>,
 ) -> ApiResult<StatusCode> {
     hub.require_admin(&headers)?;
     let tv = hub.tv(&name)?;
-    let (minutes, shuffle) = (b.minutes.filter(|m| *m > 0), b.shuffle.unwrap_or(true));
-    let cat = if b.favorites.unwrap_or(false) { category::FAVORITES } else { category::MY_PHOTOS };
+    if !hub.with_outbox(&tv, |ob| ob.retry(id)) {
+        return Err(status_err(StatusCode::NOT_FOUND, "that change isn't waiting any more"));
+    }
+    hub.queue_changed(&tv);
+    tv.kick.notify_one();
+    hub.pump_outbox(&tv);
+    Ok(StatusCode::ACCEPTED)
+}
+
+/// `DELETE /api/tvs/{tv}/queue/{id}` (admin): don't make a waiting change after all.
+async fn drop_change(
+    State(hub): State<Shared>,
+    headers: HeaderMap,
+    UrlPath((name, id)): UrlPath<(String, u64)>,
+) -> ApiResult<StatusCode> {
+    hub.require_admin(&headers)?;
+    let tv = hub.tv(&name)?;
+    match hub.with_outbox(&tv, |ob| ob.drop_change(id)) {
+        Ok(dropped) => {
+            hub.tidy(&tv, &dropped.into_iter().collect::<Vec<_>>());
+            hub.queue_changed(&tv);
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Err(()) => Err(status_err(StatusCode::CONFLICT, "that change is being made right now")),
+    }
+}
+
+/// `GET /api/tvs/{tv}/queue/{id}/preview`: a photo waiting to be sent, as a small JPEG.
+async fn change_preview(State(hub): State<Shared>, UrlPath((name, id)): UrlPath<(String, u64)>) -> ApiResult<Response> {
+    let tv = hub.tv(&name)?;
+    let path = hub
+        .with_outbox(&tv, |ob| ob.upload_file(id))
+        .ok_or_else(|| status_err(StatusCode::NOT_FOUND, "no such photo waiting"))?;
+    let bytes = tokio::fs::read(&path).await.map_err(|e| status_err(StatusCode::NOT_FOUND, e.to_string()))?;
+    let jpeg = tokio::task::spawn_blocking(move || image_prep::preview(&bytes, 512)).await??;
+    Ok(([(header::CONTENT_TYPE, "image/jpeg"), (header::CACHE_CONTROL, "private, max-age=3600")], jpeg).into_response())
+}
+
+/// `POST /api/tvs/{tv}/key` (admin): press a remote button now (not queued: it's for now).
+async fn press_key(
+    State(hub): State<Shared>,
+    headers: HeaderMap,
+    UrlPath(name): UrlPath<String>,
+    Json(b): Json<api::KeyPress>,
+) -> ApiResult<StatusCode> {
+    hub.require_admin(&headers)?;
+    let tv = hub.tv(&name)?;
+    let valid = b
+        .key
+        .strip_prefix("KEY_")
+        .is_some_and(|k| !k.is_empty() && k.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'));
+    if !valid {
+        return Err(status_err(StatusCode::BAD_REQUEST, format!("`{}` isn't a remote button", b.key)));
+    }
+    let hold = b.hold_ms.map(|ms| Duration::from_millis(ms.into()).min(LONGEST_HOLD));
     detach(async move {
-        hub.with_art(&tv, |a| async move { a.set_slideshow(minutes, shuffle, cat).await }).await?;
-        hub.status_changed(&tv);
-        Ok(StatusCode::NO_CONTENT)
+        match hub.press(&tv, &b.key, hold).await {
+            Ok(()) => Ok(StatusCode::NO_CONTENT),
+            // Off: power can still turn it on.
+            Err(e) if b.key == "KEY_POWER" && tv.config().mac.is_some() => {
+                tracing::info!("{}: remote: {e:#}; waking it instead", tv.name);
+                let cfg = tv.config();
+                for _ in 0..3 {
+                    wol::wake(cfg.mac.as_deref().unwrap_or_default(), Some(&cfg.host))?;
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+                tv.down.lock().unwrap().take();
+                hub.refresh_power(&tv);
+                Ok(StatusCode::ACCEPTED)
+            }
+            Err(e) => Err(ApiError(StatusCode::BAD_GATEWAY, e)),
+        }
     })
     .await
 }
@@ -2585,9 +2977,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("frametv-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let hash = |d: &[u8]| hex::encode(Sha256::digest(d));
-        let a = save_unique(&dir, "x.jpg", b"one", &hash(b"one")).unwrap();
-        let again = save_unique(&dir, "x.jpg", b"one", &hash(b"one")).unwrap();
-        let b = save_unique(&dir, "x.jpg", b"two", &hash(b"two")).unwrap();
+        let (a, fresh) = save_unique(&dir, "x.jpg", b"one", &hash(b"one")).unwrap();
+        assert!(fresh);
+        let (again, fresh) = save_unique(&dir, "x.jpg", b"one", &hash(b"one")).unwrap();
+        assert!(!fresh);
+        let (b, _) = save_unique(&dir, "x.jpg", b"two", &hash(b"two")).unwrap();
         assert_eq!(a, again);
         assert_eq!(b.file_name().unwrap(), "x (2).jpg");
         let _ = std::fs::remove_dir_all(&dir);

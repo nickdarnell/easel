@@ -2,7 +2,7 @@
 // talks to the server, which pushes what changes (including the TV's status) through here.
 import { watch } from "vue";
 import type { ServerEvent } from "./types";
-import { S, api, loadPhotos, loadStatus, loadTvs, thumbsArrived } from "./state";
+import { S, api, loadPhotos, loadQueue, loadStatus, loadTvs, thumbsArrived } from "./state";
 import type { Info } from "./types";
 import { type ToastHandle, toast } from "./toasts";
 import { queue } from "./upload";
@@ -39,6 +39,10 @@ function handle(e: ServerEvent) {
             (e.failed ? `, ${e.failed} failed` : ""),
         );
       }
+      break;
+    case "queue":
+      // Events leave out what the TV is being asked (the queue dialog asks for that).
+      if (here) S.queue = { ...e.queue, asking: e.queue.asking ?? S.queue?.asking ?? null };
       break;
     case "tv-event":
       // The server already acts on these, and sends `status` or `changed` if anything changed.
@@ -90,6 +94,7 @@ export function connectEvents(missed = false) {
       soon("tvs", loadTvs);
       soon("photos", loadPhotos);
       soon("status", loadStatus);
+      soon("queue", loadQueue);
     }
   };
   me.onmessage = (m) => {

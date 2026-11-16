@@ -6,6 +6,7 @@ import { pick } from "../composer";
 import {
   S,
   type SlideshowChoice,
+  changes,
   endShare,
   isAdmin,
   openDialog,
@@ -17,6 +18,7 @@ import {
   thumbUrl,
   toggleArt,
   tvReady,
+  waitingSlideshow,
   wake,
 } from "../state";
 import { store } from "../util";
@@ -60,7 +62,18 @@ const state = computed(() =>
 const identity = computed(() =>
   [props.tv.size_inches ? `${props.tv.size_inches}″` : null, props.tv.model].filter(Boolean).join(" · "),
 );
-const sendToAll = () => pick(S.tvs.filter((t) => t.power === "on").map((t) => t.name));
+const sendToAll = () => pick(S.tvs.map((t) => t.name));
+
+// ── what isn't on the TV yet ──
+const failed = computed(() => changes.value.filter((c) => c.state === "failed").length);
+const syncText = computed(() => {
+  const n = changes.value.length - failed.value;
+  const parts = [];
+  if (n) parts.push(`${n} ${n === 1 ? "change" : "changes"} waiting`);
+  if (failed.value) parts.push(`${failed.value} failed`);
+  return parts.length ? parts.join(", ") : "Up to date";
+});
+const working = computed(() => changes.value.some((c) => c.state === "working"));
 
 // ── slideshow ──
 // What Play starts: the TV's settings while it plays, otherwise the last ones chosen here.
@@ -81,9 +94,11 @@ watch(draft, (d) => {
   store.set("slideshowFavorites", d.favorites);
   store.set("slideshowShuffle", d.shuffle);
 });
-const playing = computed(() => slideshow.value.minutes > 0);
+/** The slideshow as it'll be once a waiting change to it is made. */
+const wanted = computed(() => waitingSlideshow.value ?? slideshow.value);
+const playing = computed(() => wanted.value.minutes > 0);
 /** What the controls show: the change being applied, else the TV's slideshow, else the draft. */
-const shown = computed(() => pending.slideshow ?? (playing.value ? slideshow.value : draft));
+const shown = computed(() => pending.slideshow ?? (playing.value ? wanted.value : draft));
 const intervals = computed(() => {
   const opts: [number, string][] = [
     [15, "every 15 minutes"],
@@ -105,6 +120,12 @@ const slideshowText = computed(() => {
       : playing.value
         ? "Changing the slideshow…"
         : "Starting the slideshow…";
+  const w = waitingSlideshow.value;
+  if (w)
+    return w.minutes
+      ? `Will play ${w.favorites ? "your favorites" : "all your photos"}, a new one ${every(w.minutes)}, when ${props.tv.name} answers.`
+      : `Will stop when ${props.tv.name} answers.`;
+  if (!S.status?.loaded) return `Not known yet: ${props.tv.name} hasn't answered. You can still set it.`;
   const s = slideshow.value;
   if (!s.minutes) return "Off. The TV stays on one photo.";
   return `Playing ${s.favorites ? "your favorites" : "all your photos"}${s.shuffle ? " in random order" : " in order"}, a new one ${every(s.minutes)}.`;
@@ -114,7 +135,7 @@ function change(patch: Partial<SlideshowChoice>) {
   if (playing.value) setSlideshow({ ...draft });
 }
 const play = () => setSlideshow({ ...draft, minutes: draft.minutes || 60 });
-const stop = () => setSlideshow({ ...slideshow.value, minutes: 0 });
+const stop = () => setSlideshow({ ...wanted.value, minutes: 0 });
 </script>
 
 <template>
@@ -145,8 +166,17 @@ const stop = () => setSlideshow({ ...slideshow.value, minutes: 0 });
         >
         <span v-if="identity">{{ identity }}</span>
         <span>{{ S.photos?.length ?? "…" }} photos</span>
+        <button
+          v-if="isAdmin"
+          class="pill"
+          :class="{ warn: changes.length && !failed, err: failed }"
+          title="What's waiting for the TV"
+          @click="openDialog({ kind: 'queue' })"
+        >
+          <span v-if="working" class="spinner sm"></span>{{ syncText }}
+        </button>
       </div>
-      <div v-if="activity" class="notice row activity">
+      <div v-if="activity" class="notice row activity clickable" @click="isAdmin && openDialog({ kind: 'queue' })">
         <span class="spinner sm"></span>
         <span class="grow">{{ activity.message }}</span>
         <span class="muted small">{{ elapsed }}</span>
@@ -170,8 +200,9 @@ const stop = () => setSlideshow({ ...slideshow.value, minutes: 0 });
         </button>
       </div>
 
-      <div v-if="on" class="send">
+      <div class="send">
         <button class="primary big" @click="pick([tv.name])">Choose photos…</button>
+        <button v-if="!on && tv.can_wake && isAdmin" @click="wake">Wake it up</button>
         <label class="check"><input v-model="S.showNow" type="checkbox" /> Put it on the TV right away</label>
         <span class="hint"
           >Or drag photos anywhere onto this page.
@@ -179,16 +210,13 @@ const stop = () => setSlideshow({ ...slideshow.value, minutes: 0 });
             >Send to all TVs…</a
           ></span
         >
-      </div>
-      <div v-else class="send">
-        <button v-if="tv.can_wake && isAdmin" class="primary big" @click="wake">Wake it up</button>
-        <span class="hint"
-          >Photos can be sent once the TV is on.{{ tv.can_wake ? "" : " Turn it on with the remote." }}</span
+        <span v-if="!on" class="hint"
+          >{{ tv.name }} is {{ tv.power === "standby" ? "asleep" : "off" }}: photos go on it when it's next on.
+          <a href="#" style="color: var(--accent)" @click.prevent="recheck">Check again</a></span
         >
-        <button class="ghost" @click="recheck">Check again</button>
       </div>
 
-      <div v-if="isAdmin && on && S.status?.loaded" class="slideshow" :class="{ busy: pending.slideshow }">
+      <div v-if="isAdmin && S.status" class="slideshow" :class="{ busy: pending.slideshow }">
         <div class="ss-head">
           <div class="grow">
             <div class="ss-title">Slideshow</div>
@@ -232,6 +260,7 @@ const stop = () => setSlideshow({ ...slideshow.value, minutes: 0 });
           >
           <template v-else>{{ S.status?.artmode === false ? "Switch to art mode" : "Leave art mode" }}</template>
         </button>
+        <button @click="openDialog({ kind: 'remote' })">Remote</button>
         <button @click="openDialog({ kind: 'share' })">Share…</button>
         <button class="ghost" @click="openTvSettings">TV settings</button>
       </div>

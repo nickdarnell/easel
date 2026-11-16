@@ -7,6 +7,7 @@ import {
   S,
   act,
   api,
+  changesTo,
   closeDialog,
   isAdmin,
   pending,
@@ -15,15 +16,18 @@ import {
   thumbUrl,
   thumbsArrived,
   tvPath,
+  wantedMatte,
 } from "../state";
 import { toast } from "../toasts";
-import type { Deleted, MatteUpdate, Toggle } from "../types";
+import type { MatteUpdate, Toggle } from "../types";
 import { enc, prettyDate, prettyMatte, sleep } from "../util";
 
 const props = defineProps<{ id: string }>();
 
 const photo = computed(() => S.photos?.find((x) => x.id === props.id));
-const matte = ref(photo.value?.matte || "none");
+const matte = ref((photo.value && wantedMatte(photo.value)) || "none");
+/** Changes to it that the TV hasn't made yet. */
+const waiting = computed(() => changesTo(props.id));
 const armed = ref(false);
 const path = (rest = "") => tvPath(S.tv!, `/photos/${enc(props.id)}${rest}`);
 const fav = S.filter === "favorites";
@@ -60,13 +64,12 @@ const applyMatte = () =>
   act(async () => {
     const m = matte.value;
     await api(path("/matte"), { json: { matte: m } satisfies MatteUpdate });
-    if (photo.value) photo.value.matte = m;
-    toast("Matte changed");
+    toast("Changing the matte");
   });
 const favorite = () =>
   act(async () => {
     await api(path("/favorite"), { json: { on: !fav } satisfies Toggle });
-    toast(fav ? "Removed from favorites" : "Added to favorites");
+    toast(fav ? "Removing from favorites" : "Adding to favorites");
     closeDialog();
   });
 function remove() {
@@ -75,10 +78,9 @@ function remove() {
     return;
   }
   act(async () => {
-    const r = await api<Deleted>(path(), { method: "DELETE" });
+    await api(path(), { method: "DELETE" });
     closeDialog();
-    toast(r.moved_source_to ? "Deleted (the file was moved to .removed in the folder)" : "Deleted");
-    if (S.photos) S.photos = S.photos.filter((x) => x.id !== props.id);
+    toast("Deleting it");
   });
 }
 </script>
@@ -104,7 +106,7 @@ function remove() {
             <dd>{{ photo.width }}×{{ photo.height }}</dd></template
           >
           <dt>Matte</dt>
-          <dd>{{ prettyMatte(photo.matte) }}</dd>
+          <dd>{{ prettyMatte(wantedMatte(photo)) }}</dd>
           <template v-if="photo.framing">
             <dt>Framing</dt>
             <dd>
@@ -119,6 +121,16 @@ function remove() {
           <dt>ID</dt>
           <dd class="muted">{{ photo.id }}</dd>
         </dl>
+        <div v-for="c in waiting" :key="c.id" class="notice" :class="{ err: c.state === 'failed' }">
+          <span v-if="c.state === 'working'" class="spinner sm"></span>{{ c.label }}:
+          {{
+            c.state === "failed"
+              ? `failed (${c.error})`
+              : c.state === "working"
+                ? "doing it now"
+                : `waiting for ${S.tv}`
+          }}
+        </div>
         <template v-if="isAdmin">
           <div class="row">
             <button class="primary grow" :disabled="!!pending.show || shown" @click="show">

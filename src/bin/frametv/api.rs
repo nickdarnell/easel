@@ -258,6 +258,116 @@ pub struct ShareCard {
     pub content_id: String,
 }
 
+/// A change waiting to be made on the TV. Changes to photos and the slideshow are made
+/// whenever the TV answers, rather than waited for: they're answered with [`Queued`].
+#[derive(Clone, Serialize, TS)]
+#[ts(export)]
+pub struct Change {
+    #[ts(type = "number")]
+    pub id: u64,
+    pub op: ChangeOp,
+    /// Says what it is, for showing as is.
+    pub label: String,
+    pub state: ChangeState,
+    /// Why the last attempt failed.
+    pub error: Option<String>,
+    pub attempts: u32,
+    /// When it was asked for (ms since the epoch).
+    #[ts(type = "number")]
+    pub queued: u64,
+    /// When it'll be tried again by itself (ms since the epoch), if the TV didn't answer.
+    #[ts(type = "number | null")]
+    pub retry_at: Option<u64>,
+}
+
+#[derive(Clone, Serialize, TS)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+#[ts(export)]
+pub enum ChangeOp {
+    /// A photo to add (`GET .../queue/{id}/preview` shows it).
+    Upload {
+        name: String,
+        show: bool,
+    },
+    Delete {
+        ids: Vec<String>,
+    },
+    Matte {
+        id: String,
+        matte: String,
+        portrait: Option<String>,
+    },
+    Favorite {
+        id: String,
+        on: bool,
+    },
+    Slideshow {
+        minutes: Option<u32>,
+        shuffle: bool,
+        favorites: bool,
+    },
+    Reframe {
+        id: String,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export)]
+pub enum ChangeState {
+    /// Waiting its turn, or for the TV to answer.
+    Waiting,
+    /// Being made right now.
+    Working,
+    /// The TV turned it down; it waits for someone to retry it (`POST`) or drop it (`DELETE`).
+    Failed,
+}
+
+/// The answer to a change that's made whenever the TV answers.
+#[derive(Serialize, TS)]
+#[ts(export)]
+pub struct Queued {
+    #[ts(type = "number")]
+    pub change: u64,
+}
+
+/// `GET /api/tvs/{tv}/queue`: everything the server is waiting on for a TV.
+#[derive(Clone, Serialize, TS)]
+#[ts(export)]
+pub struct TvQueue {
+    /// Changes waiting to be made, oldest first.
+    pub changes: Vec<Change>,
+    /// What the TV is being asked right now, if anything.
+    pub asking: Option<Asking>,
+    /// Requests waiting for their turn at the TV, besides the changes.
+    pub waiting: Waiting,
+    /// What the server is doing to get the TV to answer, while it's at it.
+    pub activity: Option<Activity>,
+}
+
+#[derive(Clone, Serialize, TS)]
+#[ts(export)]
+pub struct Asking {
+    /// The art app's name for the request, e.g. `get_content_list`.
+    pub request: String,
+    /// Says what it is, e.g. "Getting the photo list".
+    pub label: String,
+    /// How long it has been waiting for the answer.
+    #[ts(type = "number")]
+    pub ms: u64,
+}
+
+#[derive(Clone, Default, Serialize, TS)]
+#[ts(export)]
+pub struct Waiting {
+    /// Things someone asked the TV to do (show a photo, art mode, ...).
+    pub commands: u32,
+    /// Things a page is waiting to see (previews, the photo list).
+    pub reads: u32,
+    /// Keeping what the server knows up to date.
+    pub background: u32,
+}
+
 // ── live events (`GET /api/events`) ─────────────────────────────────────────────────────────
 
 /// Sent to every open page as server-sent events, one JSON object each.
@@ -283,6 +393,11 @@ pub enum ServerEvent {
         tv: String,
         #[serde(flatten)]
         photo: Uploaded,
+    },
+    /// The changes waiting for the TV changed (`asking` is left out).
+    Queue {
+        tv: String,
+        queue: TvQueue,
     },
     /// The TV's photos or settings changed.
     Changed {
@@ -396,6 +511,17 @@ pub struct PhotoIds {
 pub struct SyncRequest {
     /// Also remove photos from the TV whose files were deleted from the folder.
     pub delete: Option<bool>,
+}
+
+/// `POST /api/tvs/{tv}/key` (admin): press a button on the remote, straight away.
+#[derive(Deserialize, TS)]
+#[ts(export)]
+pub struct KeyPress {
+    /// E.g. `KEY_HOME`, `KEY_VOLUP`.
+    pub key: String,
+    /// Hold it down this long instead of a click (holding power turns the TV off).
+    #[ts(optional = nullable)]
+    pub hold_ms: Option<u32>,
 }
 
 /// `POST /api/tvs/{tv}/share-card` (admin): show a QR code for `url` on the TV.
