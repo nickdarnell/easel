@@ -6,7 +6,7 @@ use std::net::{Ipv4Addr, UdpSocket};
 use crate::{Error, Result};
 
 pub fn parse_mac(mac: &str) -> Result<[u8; 6]> {
-    let hex: String = mac.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    let hex: String = mac.chars().filter(char::is_ascii_hexdigit).collect();
     if hex.len() != 12 {
         return Err(Error::Other(format!("invalid MAC address `{mac}`")));
     }
