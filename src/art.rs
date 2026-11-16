@@ -77,7 +77,8 @@ pub struct Thumbnail {
     pub data: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct MatteList {
     pub types: Vec<String>,
     pub colors: Vec<String>,

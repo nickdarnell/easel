@@ -5,6 +5,7 @@ import MatteSelect from "./MatteSelect.vue";
 import { openReframe } from "../composer";
 import { S, act, api, closeDialog, isAdmin, loadStatus, thumbUrl, tvPath } from "../state";
 import { toast } from "../toasts";
+import type { Deleted, MatteUpdate, Toggle } from "../types";
 import { enc, prettyDate, prettyMatte } from "../util";
 
 const props = defineProps<{ id: string }>();
@@ -25,13 +26,13 @@ const show = () =>
 const applyMatte = () =>
   act(async () => {
     const m = matte.value;
-    await api(path("/matte"), { json: { matte: m } });
+    await api(path("/matte"), { json: { matte: m } satisfies MatteUpdate });
     if (photo.value) photo.value.matte = m;
     toast("Matte changed");
   });
 const favorite = () =>
   act(async () => {
-    await api(path("/favorite"), { json: { on: !fav } });
+    await api(path("/favorite"), { json: { on: !fav } satisfies Toggle });
     toast(fav ? "Removed from favorites" : "Added to favorites");
     closeDialog();
   });
@@ -41,7 +42,7 @@ function remove() {
     return;
   }
   act(async () => {
-    const r = await api<{ moved_source_to: string | null }>(path(), { method: "DELETE" });
+    const r = await api<Deleted>(path(), { method: "DELETE" });
     closeDialog();
     toast(r.moved_source_to ? "Deleted (the file was moved to .removed in the folder)" : "Deleted");
     if (S.photos) S.photos = S.photos.filter((x) => x.id !== props.id);

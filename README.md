@@ -178,5 +178,10 @@ cargo run --bin frametv -- serve     # http://localhost:3273
 cd web && npm run dev                # http://localhost:5173
 ```
 
+The API's TypeScript types in `web/src/api/` are generated from the Rust types in
+`src/bin/frametv/api.rs` by [ts-rs](https://github.com/Aleph-Alpha/ts-rs) when you run
+`cargo test`; commit them along with the change. Don't edit them by hand. CI fails if they're
+out of date, and `npm run build` fails if the UI doesn't match them.
+
 Before committing: `npm run format` (Prettier) in `web/`, and `cargo fmt` and
 `cargo clippy --all-targets -- -D warnings` for the Rust side.

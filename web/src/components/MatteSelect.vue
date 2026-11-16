@@ -1,10 +1,10 @@
 <script setup lang="ts">
 // A matte picker: type (with "No matte", and optionally "Automatic") plus colour.
 import { computed } from "vue";
-import type { Mattes } from "../types";
+import type { MatteList } from "../types";
 import { cap, matteParts } from "../util";
 
-const props = defineProps<{ mattes: Mattes | null; allowAuto?: boolean }>();
+const props = defineProps<{ mattes: MatteList | null; allowAuto?: boolean }>();
 const model = defineModel<string>({ required: true });
 
 const plain = (t: string) => t === "none" || t === "auto";

@@ -35,7 +35,8 @@ pub struct UploadRecord {
 }
 
 /// Someone's explicit choice of how a photo sits on the screen.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 pub struct Framing {
     /// `cover` fills the screen (no matte); `contain` shows the whole photo.
     pub fit: image_prep::Fit,

@@ -1,5 +1,5 @@
 import { computed, reactive, ref, watch } from "vue";
-import type { Filter, Info, Mattes, Photo, Settings, Status, Tv } from "./types";
+import type { Filter, Info, MatteList, Photo, Settings, SlideshowUpdate, Status, Toggle, Tv } from "./types";
 import { toast } from "./toasts";
 import { enc, errorMessage, sleep, store } from "./util";
 
@@ -14,7 +14,7 @@ export const S = reactive({
   photos: null as Photo[] | null,
   photosErr: null as string | null,
   filter: "all" as Filter,
-  mattes: null as Mattes | null,
+  mattes: null as MatteList | null,
   pw: store.get("pw", ""),
   /** Set on `/tv/<name>`: the guest page for one TV. */
   guestTv: guestMatch ? decodeURIComponent(guestMatch[1]!) : null,
@@ -190,9 +190,9 @@ export function setFilter(f: Filter) {
   }
 }
 
-export async function getMattes(): Promise<Mattes> {
+export async function getMattes(): Promise<MatteList> {
   if (!S.mattes && S.tv) {
-    S.mattes = await api<Mattes>(tvPath(S.tv, "/mattes")).catch(() => ({ types: [], colors: [] }));
+    S.mattes = await api<MatteList>(tvPath(S.tv, "/mattes")).catch(() => ({ types: [], colors: [] }));
   }
   return S.mattes ?? { types: [], colors: [] };
 }
@@ -207,14 +207,14 @@ export function thumbsArrived(ids: string[]) {
 // ── TV actions ───────────────────────────────────────────────────────
 export function toggleArt() {
   return act(async () => {
-    await api(tvPath(S.tv!, "/artmode"), { json: { on: S.status?.artmode === false } });
+    await api(tvPath(S.tv!, "/artmode"), { json: { on: S.status?.artmode === false } satisfies Toggle });
     setTimeout(loadStatus, 1200);
   });
 }
 
 export function setSlideshow(minutes: number) {
   return act(async () => {
-    await api(tvPath(S.tv!, "/slideshow"), { json: { minutes, shuffle: true } });
+    await api(tvPath(S.tv!, "/slideshow"), { json: { minutes, shuffle: true } satisfies SlideshowUpdate });
     toast(minutes ? "Slideshow on" : "Slideshow off");
   });
 }

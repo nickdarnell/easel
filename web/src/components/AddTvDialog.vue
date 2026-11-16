@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref } from "vue";
 import ModalDialog from "./ModalDialog.vue";
-import type { Discovered, Paired } from "../types";
+import type { AddTv, Discovered, Paired } from "../types";
 import { S, act, api, closeDialog, loadTvs, selectTv } from "../state";
 import { errorMessage } from "../util";
 
@@ -21,7 +21,7 @@ const pair = (h: string, n: string | null) =>
     paired.value = null;
     error.value = "";
     try {
-      const r = await api<Paired>("/api/tvs", { json: { host: h, name: n } });
+      const r = await api<Paired>("/api/tvs", { json: { host: h, name: n } satisfies AddTv });
       paired.value = r;
       await loadTvs();
       if (!S.guestTv) selectTv(r.name);

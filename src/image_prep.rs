@@ -14,8 +14,9 @@ use crate::{Error, Result};
 pub const SUPPORTED_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp", "tif", "tiff", "gif"];
 
 /// How to fit an image to the screen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "lowercase")]
+#[ts(export)]
 pub enum Fit {
     /// Fill the screen if the photo is already close to the panel's shape (within ~12%),
     /// otherwise keep the whole photo and let the TV's matte frame it.
@@ -54,7 +55,8 @@ impl std::fmt::Display for Fit {
 }
 
 /// A region of the (upright) photo to keep, as fractions of its width and height.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 pub struct Crop {
     pub x: f32,
     pub y: f32,

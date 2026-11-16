@@ -30,6 +30,14 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+      # cargo test regenerates web/src/api from the Rust API types (ts-rs); they must be committed.
+      - name: Check the TypeScript bindings are up to date
+        run: |
+          git add --intent-to-add web/src/api
+          git diff --exit-code -- web/src/api || {
+            echo "::error::web/src/api is stale: run cargo test and commit the result"
+            exit 1
+          }
 
   web:
     runs-on: ubuntu-latest

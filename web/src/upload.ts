@@ -1,6 +1,6 @@
 // The upload queue: one upload at a time per TV, with progress.
 import { reactive } from "vue";
-import type { Framing, UploadResult } from "./types";
+import type { ErrorBody, Framing, Uploaded } from "./types";
 import { S, tvPath } from "./state";
 import { enc, errorMessage } from "./util";
 
@@ -91,7 +91,7 @@ async function prepareFile(file: File): Promise<{ body: Blob; name: string; type
   return { body: file, name: file.name, type: file.type || "application/octet-stream" };
 }
 
-async function sendOne(item: QueueItem): Promise<UploadResult> {
+async function sendOne(item: QueueItem): Promise<Uploaded> {
   const f = await prepareFile(item.file);
   // XMLHttpRequest rather than fetch, for upload progress.
   return new Promise((resolve, reject) => {
@@ -111,14 +111,14 @@ async function sendOne(item: QueueItem): Promise<UploadResult> {
       item.msg = item.pct < 100 ? `Uploading ${item.pct}%` : "Preparing on the TV…";
     };
     x.onload = () => {
-      let body: UploadResult & { error?: string } = {};
+      let body: unknown = null;
       try {
         body = JSON.parse(x.responseText);
       } catch {
-        // Keep the empty body.
+        // Not JSON: report the status.
       }
-      if (x.status === 200) resolve(body);
-      else reject(new Error(body.error || `Failed (${x.status})`));
+      if (x.status === 200) resolve(body as Uploaded);
+      else reject(new Error((body as Partial<ErrorBody> | null)?.error || `Failed (${x.status})`));
     };
     x.onerror = () => reject(new Error("Network error"));
     x.send(f.body);

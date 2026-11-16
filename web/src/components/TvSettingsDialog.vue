@@ -4,6 +4,7 @@ import ModalDialog from "./ModalDialog.vue";
 import MatteSelect from "./MatteSelect.vue";
 import { S, act, api, closeDialog, curTv, loadTvs, tvPath } from "../state";
 import { toast } from "../toasts";
+import type { SyncRequest, TvUpdate } from "../types";
 
 const tv = curTv.value!;
 const fitOptions: [string, string][] = [
@@ -23,7 +24,7 @@ const mattes = S.mattes;
 
 const save = () =>
   act(async () => {
-    const body: Record<string, string> = { fit: fit.value, folder: folder.value };
+    const body: TvUpdate = { fit: fit.value, folder: folder.value };
     if (mattes) {
       body.matte = matte.value;
       body.portrait_matte = portrait.value;
@@ -35,7 +36,7 @@ const save = () =>
   });
 const sync = () =>
   act(async () => {
-    await api(tvPath(tv.name, "/sync"), { json: { delete: syncDelete.value } });
+    await api(tvPath(tv.name, "/sync"), { json: { delete: syncDelete.value } satisfies SyncRequest });
     closeDialog();
     toast("Syncing…");
   });

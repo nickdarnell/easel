@@ -24,15 +24,17 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::Stream;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, broadcast, mpsc};
 
-use samsung_frame::art::{ArtClient, UploadOptions};
+use samsung_frame::art::{ArtClient, MatteList, UploadOptions};
 use samsung_frame::config::{Config, TvConfig};
 use samsung_frame::protocol::category;
 use samsung_frame::sync::{self, Framing, TvState};
 use samsung_frame::{discovery, image_prep, localsend, pairing, rest, wol};
+
+use crate::api::{self, ServerEvent};
 
 // The web UI (`web/`), embedded by build.rs.
 include!(concat!(env!("OUT_DIR"), "/web_files.rs"));
@@ -68,9 +70,9 @@ struct Hub {
     state_dir: PathBuf,
     data_dir: PathBuf,
     tvs: RwLock<Vec<Arc<Tv>>>,
-    events: broadcast::Sender<Value>,
-    /// Advertised LocalSend targets (alias, port).
-    localsend: StdMutex<Vec<Value>>,
+    events: broadcast::Sender<ServerEvent>,
+    /// Advertised LocalSend targets.
+    localsend: StdMutex<Vec<api::LocalSendTarget>>,
     localsend_error: StdMutex<Option<String>>,
     localsend_port: u16,
     /// The running LocalSend receiver; replacing it stops the old one.
@@ -93,7 +95,7 @@ impl IntoResponse for ApiError {
         if self.0.is_server_error() {
             tracing::warn!("request failed: {msg}");
         }
-        (self.0, Json(json!({"error": msg}))).into_response()
+        (self.0, Json(api::ErrorBody { error: msg })).into_response()
     }
 }
 
@@ -155,8 +157,8 @@ impl Hub {
         self.tvs.read().unwrap().clone()
     }
 
-    fn emit(&self, v: Value) {
-        let _ = self.events.send(v);
+    fn emit(&self, event: ServerEvent) {
+        let _ = self.events.send(event);
     }
 
     fn server_settings(&self) -> samsung_frame::config::ServerSettings {
@@ -230,7 +232,7 @@ impl Hub {
         tokio::spawn(async move {
             loop {
                 match rx.recv().await {
-                    Ok(m) => hub.emit(json!({"type": "tv-event", "tv": name, "event": m.event, "data": m.data})),
+                    Ok(m) => hub.emit(ServerEvent::TvEvent { tv: name.clone(), event: m.event, data: m.data }),
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(_) => break,
                 }
@@ -299,7 +301,7 @@ impl Hub {
         data: &[u8],
         show: bool,
         framing: Option<Framing>,
-    ) -> anyhow::Result<Value> {
+    ) -> anyhow::Result<api::Uploaded> {
         let cfg = tv.config();
         let dir = cfg.folder.clone().unwrap_or_else(|| self.data_dir.join("photos").join(&tv.name));
         let hash = hex::encode(Sha256::digest(data));
@@ -322,7 +324,7 @@ impl Hub {
         let (content_id, duplicate) = if let Some(id) = same {
             (id.clone(), true)
         } else {
-            self.emit(json!({"type": "uploading", "tv": tv.name, "name": file_name}));
+            self.emit(ServerEvent::Uploading { tv: tv.name.clone(), name: file_name.to_owned() });
             let mut settings = upload_settings(&cfg);
             if let Some(f) = &framing {
                 f.apply(&mut settings);
@@ -347,12 +349,9 @@ impl Hub {
             })
             .await?;
         }
-        let out = json!({
-            "type": "uploaded", "tv": tv.name, "content_id": content_id, "name": file_name,
-            "duplicate": duplicate, "shown": show,
-        });
-        self.emit(out.clone());
-        Ok(out)
+        let photo = api::Uploaded { content_id, name: file_name.to_owned(), duplicate, shown: show };
+        self.emit(ServerEvent::Uploaded { tv: tv.name.clone(), photo: photo.clone() });
+        Ok(photo)
     }
 
     /// (Re)start the LocalSend targets to match the current settings and TVs.
@@ -374,7 +373,7 @@ impl Hub {
                 }
             }
         }
-        self.emit(json!({"type": "settings-changed"}));
+        self.emit(ServerEvent::SettingsChanged);
     }
 }
 
@@ -469,7 +468,7 @@ pub async fn run(cfg: Config, cfg_path: PathBuf, state_dir: PathBuf, opts: Serve
         println!("  no admin password yet: set one in the web app's settings (gear button)");
     }
     for d in hub.localsend.lock().unwrap().iter() {
-        println!("LocalSend target:  \"{}\" (port {})", d["alias"].as_str().unwrap_or("?"), d["port"]);
+        println!("LocalSend target:  \"{}\" (port {})", d.alias, d.port);
     }
     if hub.all_tvs().is_empty() {
         println!("No TVs paired yet: open the web app and choose \"Add a TV\".");
@@ -513,8 +512,11 @@ async fn start_localsend(hub: &Shared, pin: Option<String>) -> anyhow::Result<lo
         .collect::<Vec<_>>();
     let (tx, mut rx) = mpsc::channel::<localsend::Received>(32);
     let receiver = localsend::serve(devices.clone(), hub.localsend_port, tx).await?;
-    *hub.localsend.lock().unwrap() =
-        devices.iter().zip(&receiver.ports).map(|(d, p)| json!({"alias": d.alias, "port": p})).collect();
+    *hub.localsend.lock().unwrap() = devices
+        .iter()
+        .zip(&receiver.ports)
+        .map(|(d, p)| api::LocalSendTarget { alias: d.alias.clone(), port: *p })
+        .collect();
 
     let hub = Arc::clone(hub);
     tokio::spawn(async move {
@@ -530,7 +532,10 @@ async fn start_localsend(hub: &Shared, pin: Option<String>) -> anyhow::Result<lo
                 // TVs work in parallel; each TV's transfers are serialized by its own lock.
                 tokio::spawn(async move {
                     if let Err(e) = hub.ingest(&tv, &file_name, &data, show, None).await {
-                        hub.emit(json!({"type": "error", "tv": tv.name, "message": format!("{file_name} from {from}: {e:#}")}));
+                        hub.emit(ServerEvent::Error {
+                            tv: tv.name.clone(),
+                            message: format!("{file_name} from {from}: {e:#}"),
+                        });
                     }
                 });
             }
@@ -578,52 +583,42 @@ async fn manifest() -> impl IntoResponse {
     )
 }
 
-async fn info(State(hub): State<Shared>, headers: HeaderMap) -> Json<Value> {
+async fn info(State(hub): State<Shared>, headers: HeaderMap) -> Json<api::Info> {
     let settings = hub.server_settings();
-    Json(json!({
-        "admin": hub.is_admin(&headers),
-        "password_set": settings.admin_password.is_some(),
-        "public_url": settings.public_url,
-        "localsend": *hub.localsend.lock().unwrap(),
-        "heif": image_prep::heif_supported(),
-        "version": env!("CARGO_PKG_VERSION"),
-    }))
-}
-
-fn settings_json(hub: &Hub) -> Value {
-    let s = hub.server_settings();
-    json!({
-        "password_set": s.admin_password.is_some(),
-        "public_url": s.public_url,
-        "localsend": s.localsend,
-        "localsend_pin": s.localsend_pin,
-        "show_on_receive": s.show_on_receive,
-        "localsend_targets": *hub.localsend.lock().unwrap(),
-        "localsend_error": *hub.localsend_error.lock().unwrap(),
-        "in_docker": Path::new("/.dockerenv").exists(),
+    Json(api::Info {
+        admin: hub.is_admin(&headers),
+        password_set: settings.admin_password.is_some(),
+        public_url: settings.public_url,
+        localsend: hub.localsend.lock().unwrap().clone(),
+        heif: image_prep::heif_supported(),
+        version: env!("CARGO_PKG_VERSION").to_owned(),
     })
 }
 
-async fn get_settings(State(hub): State<Shared>, headers: HeaderMap) -> ApiResult<Json<Value>> {
-    hub.require_admin(&headers)?;
-    Ok(Json(settings_json(&hub)))
+fn settings(hub: &Hub) -> api::Settings {
+    let s = hub.server_settings();
+    api::Settings {
+        password_set: s.admin_password.is_some(),
+        public_url: s.public_url,
+        localsend: s.localsend,
+        localsend_pin: s.localsend_pin,
+        show_on_receive: s.show_on_receive,
+        localsend_targets: hub.localsend.lock().unwrap().clone(),
+        localsend_error: hub.localsend_error.lock().unwrap().clone(),
+        in_docker: Path::new("/.dockerenv").exists(),
+    }
 }
 
-/// Fields left out stay as they are; empty strings clear.
-#[derive(Deserialize)]
-struct SettingsBody {
-    password: Option<String>,
-    public_url: Option<String>,
-    localsend: Option<bool>,
-    localsend_pin: Option<String>,
-    show_on_receive: Option<bool>,
+async fn get_settings(State(hub): State<Shared>, headers: HeaderMap) -> ApiResult<Json<api::Settings>> {
+    hub.require_admin(&headers)?;
+    Ok(Json(settings(&hub)))
 }
 
 async fn put_settings(
     State(hub): State<Shared>,
     headers: HeaderMap,
-    Json(b): Json<SettingsBody>,
-) -> ApiResult<Json<Value>> {
+    Json(b): Json<api::SettingsUpdate>,
+) -> ApiResult<Json<api::Settings>> {
     hub.require_admin(&headers)?;
     let public_url = match b.public_url.as_deref().map(str::trim) {
         Some("") => Some(None),
@@ -661,11 +656,11 @@ async fn put_settings(
     })?;
     let after = hub.server_settings();
     if (before.localsend, &before.localsend_pin) == (after.localsend, &after.localsend_pin) {
-        hub.emit(json!({"type": "settings-changed"}));
+        hub.emit(ServerEvent::SettingsChanged);
     } else {
         hub.restart_localsend().await;
     }
-    Ok(Json(settings_json(&hub)))
+    Ok(Json(settings(&hub)))
 }
 
 /// Turn any photo the server can read (HEIC included) into a browser-friendly JPEG preview.
@@ -684,7 +679,10 @@ async fn events_stream(State(hub): State<Shared>) -> Sse<impl Stream<Item = Resu
     let stream = futures_util::stream::unfold(rx, |mut rx| async move {
         loop {
             match rx.recv().await {
-                Ok(v) => return Some((Ok(Event::default().data(v.to_string())), rx)),
+                Ok(ev) => {
+                    let json = serde_json::to_string(&ev).unwrap_or_default();
+                    return Some((Ok(Event::default().data(json)), rx));
+                }
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(_) => return None,
             }
@@ -711,51 +709,60 @@ async fn qr(Query(q): Query<QrQuery>) -> ApiResult<Response> {
     Ok(([(header::CONTENT_TYPE, "image/svg+xml"), (header::CACHE_CONTROL, "max-age=3600")], svg).into_response())
 }
 
-async fn discover(State(hub): State<Shared>, headers: HeaderMap) -> ApiResult<Json<Value>> {
+async fn discover(State(hub): State<Shared>, headers: HeaderMap) -> ApiResult<Json<Vec<api::Discovered>>> {
     hub.require_admin(&headers)?;
     let (ssdp, scan) = tokio::join!(discovery::ssdp(Duration::from_secs(2)), discovery::scan_subnet());
     let known: HashSet<String> = hub.all_tvs().iter().map(|t| t.config().host).collect();
     let mut seen = HashSet::new();
-    let found: Vec<Value> = ssdp
+    let found = ssdp
         .unwrap_or_default()
         .into_iter()
         .chain(scan.unwrap_or_default())
         .filter(|d| seen.insert(d.ip.to_string()))
         .map(|d| {
-            let ip = d.ip.to_string();
-            json!({
-                "host": ip, "name": pairing::friendly_name(&d.info.display_name()), "model": d.info.device.model_name,
-                "frame": d.info.is_frame(), "power": d.info.power_state(), "paired": known.contains(&ip),
-            })
+            let host = d.ip.to_string();
+            api::Discovered {
+                name: pairing::friendly_name(&d.info.display_name()),
+                frame: d.info.is_frame(),
+                power: api::Power::from_tv(d.info.power_state()),
+                paired: known.contains(&host),
+                model: d.info.device.model_name,
+                host,
+            }
         })
         .collect();
-    Ok(Json(Value::Array(found)))
+    Ok(Json(found))
 }
 
-async fn list_tvs(State(hub): State<Shared>) -> Json<Value> {
+async fn list_tvs(State(hub): State<Shared>) -> Json<Vec<api::Tv>> {
     let checks = hub.all_tvs().into_iter().map(|tv| async move {
         let cfg = tv.config();
         let power = match rest::device_info(&cfg.host, Duration::from_millis(1500)).await {
-            Ok(i) => i.power_state().to_string(),
-            Err(_) => "off".into(),
+            Ok(i) => api::Power::from_tv(i.power_state()),
+            Err(_) => api::Power::Off,
         };
-        json!({
-            "name": cfg.name, "host": cfg.host, "model": cfg.model, "resolution": cfg.panel_size(),
-            "folder": cfg.folder, "matte": cfg.matte, "portrait_matte": cfg.portrait_matte, "fit": cfg.fit,
-            "power": power, "can_wake": cfg.mac.is_some(),
-        })
+        api::Tv {
+            resolution: cfg.panel_size(),
+            folder: cfg.folder.as_ref().map(|f| f.display().to_string()),
+            fit: cfg.fit.as_deref().and_then(|f| f.parse().ok()),
+            can_wake: cfg.mac.is_some(),
+            power,
+            name: cfg.name,
+            host: cfg.host,
+            model: cfg.model,
+            matte: cfg.matte,
+            portrait_matte: cfg.portrait_matte,
+        }
     });
-    Json(Value::Array(futures_util::future::join_all(checks).await))
-}
-
-#[derive(Deserialize)]
-struct AddTv {
-    host: String,
-    name: Option<String>,
+    Json(futures_util::future::join_all(checks).await)
 }
 
 /// Pair a TV. Takes up to a minute: someone has to press Allow on the TV.
-async fn add_tv(State(hub): State<Shared>, headers: HeaderMap, Json(b): Json<AddTv>) -> ApiResult<Json<Value>> {
+async fn add_tv(
+    State(hub): State<Shared>,
+    headers: HeaderMap,
+    Json(b): Json<api::AddTv>,
+) -> ApiResult<Json<api::Paired>> {
     hub.require_admin(&headers)?;
     let host = b.host.trim();
     if host.is_empty() {
@@ -777,29 +784,22 @@ async fn add_tv(State(hub): State<Shared>, headers: HeaderMap, Json(b): Json<Add
         tvs.retain(|t| !t.name.eq_ignore_ascii_case(&tv_cfg.name) && t.config().host != tv_cfg.host);
         tvs.push(Tv::new(tv_cfg.clone()));
     }
-    hub.emit(json!({"type": "tvs-changed"}));
+    hub.emit(ServerEvent::TvsChanged);
     let h = Arc::clone(&hub);
     tokio::spawn(async move { h.restart_localsend().await });
-    Ok(Json(json!({
-        "name": tv_cfg.name, "api_version": paired.api_version, "photos": paired.photo_count, "frame": paired.is_frame,
-    })))
-}
-
-#[derive(Deserialize)]
-struct UpdateTv {
-    matte: Option<String>,
-    portrait_matte: Option<String>,
-    fit: Option<String>,
-    /// Folder (on the machine running the server) to sync from and to save received photos in.
-    /// Empty string clears it.
-    folder: Option<String>,
+    Ok(Json(api::Paired {
+        name: tv_cfg.name,
+        api_version: paired.api_version,
+        photos: paired.photo_count.map(|n| n as u32),
+        frame: paired.is_frame,
+    }))
 }
 
 async fn update_tv(
     State(hub): State<Shared>,
     headers: HeaderMap,
     UrlPath(name): UrlPath<String>,
-    Json(b): Json<UpdateTv>,
+    Json(b): Json<api::TvUpdate>,
 ) -> ApiResult<StatusCode> {
     hub.require_admin(&headers)?;
     let tv = hub.tv(&name)?;
@@ -835,7 +835,7 @@ async fn update_tv(
         c.clone()
     };
     hub.save_config(|c| c.upsert(updated))?;
-    hub.emit(json!({"type": "tvs-changed"}));
+    hub.emit(ServerEvent::TvsChanged);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -858,21 +858,21 @@ async fn forget_tv(
             c.default_tv = c.tvs.first().map(|t| t.name.clone());
         }
     })?;
-    hub.emit(json!({"type": "tvs-changed"}));
+    hub.emit(ServerEvent::TvsChanged);
     let h = Arc::clone(&hub);
     tokio::spawn(async move { h.restart_localsend().await });
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn tv_status(State(hub): State<Shared>, UrlPath(name): UrlPath<String>) -> ApiResult<Json<Value>> {
+async fn tv_status(State(hub): State<Shared>, UrlPath(name): UrlPath<String>) -> ApiResult<Json<api::Status>> {
     let tv = hub.tv(&name)?;
     let art = hub.art(&tv).await?;
     let (artmode, current, slideshow) = tokio::join!(art.artmode(), art.current_artwork(), art.slideshow_status());
-    Ok(Json(json!({
-        "artmode": artmode.ok(),
-        "current": current.ok(),
-        "slideshow": slideshow.ok().map(|s| json!({"minutes": s.minutes, "shuffle": s.shuffle})),
-    })))
+    Ok(Json(api::Status {
+        artmode: artmode.ok(),
+        current: current.ok().map(|c| api::Current { content_id: c.content_id }),
+        slideshow: slideshow.ok().map(|s| api::Slideshow { minutes: s.minutes, shuffle: s.shuffle }),
+    }))
 }
 
 #[derive(Deserialize)]
@@ -884,7 +884,7 @@ async fn photos(
     State(hub): State<Shared>,
     UrlPath(name): UrlPath<String>,
     Query(q): Query<PhotosQuery>,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Json<Vec<api::Photo>>> {
     let tv = hub.tv(&name)?;
     let cat = match q.category.as_deref() {
         Some("favorites") => category::FAVORITES,
@@ -895,21 +895,25 @@ async fn photos(
     items.sort_by(|a, b| b.image_date.cmp(&a.image_date).then_with(|| b.content_id.cmp(&a.content_id)));
     let state = TvState::load(&hub.state_file(&tv)).unwrap_or_default();
     let dir = hub.thumb_dir(&tv);
-    let out: Vec<Value> = items
+    let out: Vec<api::Photo> = items
         .iter()
         .map(|i| {
             let rec = state.uploads.get(&i.content_id);
-            json!({
-                "id": i.content_id, "width": i.width, "height": i.height, "date": i.image_date,
-                "matte": i.matte_id, "portrait_matte": i.portrait_matte_id,
-                "mine": rec.is_some(),
-                "source": rec.and_then(|r| r.source.file_name()).map(|n| n.to_string_lossy().to_string()),
-                "framing": rec.and_then(|r| r.framing.as_ref()),
+            api::Photo {
+                id: i.content_id.clone(),
+                width: i.width,
+                height: i.height,
+                date: i.image_date.clone(),
+                matte: i.matte_id.clone(),
+                portrait_matte: i.portrait_matte_id.clone(),
+                mine: rec.is_some(),
+                source: rec.and_then(|r| r.source.file_name()).map(|n| n.to_string_lossy().to_string()),
+                framing: rec.and_then(|r| r.framing.clone()),
                 // Reframing re-prepares from the original file, so it has to still be there.
-                "reframe": rec.is_some_and(|r| r.source.is_file()),
+                reframe: rec.is_some_and(|r| r.source.is_file()),
                 // Cached thumbnails load instantly; others arrive later via a `thumbs` event.
-                "thumb": find_thumb(&dir, &i.content_id).is_some(),
-            })
+                thumb: find_thumb(&dir, &i.content_id).is_some(),
+            }
         })
         .collect();
 
@@ -924,11 +928,11 @@ async fn photos(
                     tracing::warn!("thumbnail prefetch for {}: {e:#}", tv.name);
                     break;
                 }
-                hub.emit(json!({"type": "thumbs", "tv": tv.name, "ids": chunk}));
+                hub.emit(ServerEvent::Thumbs { tv: tv.name.clone(), ids: chunk.to_vec() });
             }
         });
     }
-    Ok(Json(Value::Array(out)))
+    Ok(Json(out))
 }
 
 fn safe_id(id: &str) -> String {
@@ -1006,7 +1010,7 @@ async fn upload(
     UrlPath(name): UrlPath<String>,
     Query(q): Query<UploadQuery>,
     body: Bytes,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Json<api::Uploaded>> {
     let tv = hub.tv(&name)?;
     if body.is_empty() {
         return Err(status_err(StatusCode::BAD_REQUEST, "empty upload"));
@@ -1016,7 +1020,7 @@ async fn upload(
     match hub.ingest(&tv, &file_name, &body, q.show.unwrap_or(false), framing).await {
         Ok(v) => Ok(Json(v)),
         Err(e) => {
-            hub.emit(json!({"type": "error", "tv": tv.name, "message": format!("{file_name}: {e:#}")}));
+            hub.emit(ServerEvent::Error { tv: tv.name.clone(), message: format!("{file_name}: {e:#}") });
             Err(e.into())
         }
     }
@@ -1037,17 +1041,11 @@ async fn show(
     Ok(StatusCode::NO_CONTENT)
 }
 
-#[derive(Deserialize)]
-struct MatteBody {
-    matte: String,
-    portrait: Option<String>,
-}
-
 async fn set_matte(
     State(hub): State<Shared>,
     headers: HeaderMap,
     UrlPath((name, id)): UrlPath<(String, String)>,
-    Json(b): Json<MatteBody>,
+    Json(b): Json<api::MatteUpdate>,
 ) -> ApiResult<StatusCode> {
     hub.require_admin(&headers)?;
     let tv = hub.tv(&name)?;
@@ -1056,20 +1054,15 @@ async fn set_matte(
         async move { a.change_matte(&id, &matte, portrait.as_deref()).await }
     })
     .await?;
-    hub.emit(json!({"type": "changed", "tv": tv.name}));
+    hub.emit(ServerEvent::Changed { tv: tv.name.clone() });
     Ok(StatusCode::NO_CONTENT)
-}
-
-#[derive(Deserialize)]
-struct OnBody {
-    on: bool,
 }
 
 async fn favorite(
     State(hub): State<Shared>,
     headers: HeaderMap,
     UrlPath((name, id)): UrlPath<(String, String)>,
-    Json(b): Json<OnBody>,
+    Json(b): Json<api::Toggle>,
 ) -> ApiResult<StatusCode> {
     hub.require_admin(&headers)?;
     let tv = hub.tv(&name)?;
@@ -1078,7 +1071,7 @@ async fn favorite(
         async move { a.set_favorite(&id, b.on).await }
     })
     .await?;
-    hub.emit(json!({"type": "changed", "tv": tv.name}));
+    hub.emit(ServerEvent::Changed { tv: tv.name.clone() });
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1108,7 +1101,7 @@ async fn reframe(
     headers: HeaderMap,
     UrlPath((name, id)): UrlPath<(String, String)>,
     Json(framing): Json<Framing>,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Json<api::Reframed>> {
     hub.require_admin(&headers)?;
     let tv = hub.tv(&name)?;
     let _guard = tv.xfer.lock().await;
@@ -1141,8 +1134,8 @@ async fn reframe(
     if let Err(e) = hub.delete_from_tv(&tv, vec![id.clone()]).await {
         tracing::warn!("removing the old version of {id} from {}: {e:#}", tv.name);
     }
-    hub.emit(json!({"type": "changed", "tv": tv.name}));
-    Ok(Json(json!({"content_id": result.content_id, "replaced": id, "matte": result.matte})))
+    hub.emit(ServerEvent::Changed { tv: tv.name.clone() });
+    Ok(Json(api::Reframed { content_id: result.content_id, replaced: id, matte: result.matte }))
 }
 
 /// Delete from the TV. If the photo came from the TV's sync folder, its file is moved to
@@ -1151,7 +1144,7 @@ async fn delete_photo(
     State(hub): State<Shared>,
     headers: HeaderMap,
     UrlPath((name, id)): UrlPath<(String, String)>,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Json<api::Deleted>> {
     hub.require_admin(&headers)?;
     let tv = hub.tv(&name)?;
     hub.delete_from_tv(&tv, vec![id.clone()]).await?;
@@ -1171,21 +1164,20 @@ async fn delete_photo(
         }
         state.save(&state_file)?;
     }
-    hub.emit(json!({"type": "changed", "tv": tv.name}));
-    Ok(Json(json!({"deleted": id, "moved_source_to": moved})))
+    hub.emit(ServerEvent::Changed { tv: tv.name.clone() });
+    Ok(Json(api::Deleted { deleted: id, moved_source_to: moved.map(|p| p.display().to_string()) }))
 }
 
-async fn mattes(State(hub): State<Shared>, UrlPath(name): UrlPath<String>) -> ApiResult<Json<Value>> {
+async fn mattes(State(hub): State<Shared>, UrlPath(name): UrlPath<String>) -> ApiResult<Json<MatteList>> {
     let tv = hub.tv(&name)?;
-    let m = hub.with_art(&tv, |a| async move { a.matte_list().await }).await?;
-    Ok(Json(serde_json::to_value(m)?))
+    Ok(Json(hub.with_art(&tv, |a| async move { a.matte_list().await }).await?))
 }
 
 async fn artmode(
     State(hub): State<Shared>,
     headers: HeaderMap,
     UrlPath(name): UrlPath<String>,
-    Json(b): Json<OnBody>,
+    Json(b): Json<api::Toggle>,
 ) -> ApiResult<StatusCode> {
     hub.require_admin(&headers)?;
     let tv = hub.tv(&name)?;
@@ -1193,36 +1185,18 @@ async fn artmode(
     Ok(StatusCode::NO_CONTENT)
 }
 
-#[derive(Deserialize)]
-struct SlideshowBody {
-    /// None or 0 turns the slideshow off.
-    minutes: Option<u32>,
-    #[serde(default = "yes")]
-    shuffle: bool,
-}
-
-fn yes() -> bool {
-    true
-}
-
 async fn slideshow(
     State(hub): State<Shared>,
     headers: HeaderMap,
     UrlPath(name): UrlPath<String>,
-    Json(b): Json<SlideshowBody>,
+    Json(b): Json<api::SlideshowUpdate>,
 ) -> ApiResult<StatusCode> {
     hub.require_admin(&headers)?;
     let tv = hub.tv(&name)?;
-    let minutes = b.minutes.filter(|m| *m > 0);
-    hub.with_art(&tv, |a| async move { a.set_slideshow(minutes, b.shuffle, category::MY_PHOTOS).await }).await?;
-    hub.emit(json!({"type": "changed", "tv": tv.name}));
+    let (minutes, shuffle) = (b.minutes.filter(|m| *m > 0), b.shuffle.unwrap_or(true));
+    hub.with_art(&tv, |a| async move { a.set_slideshow(minutes, shuffle, category::MY_PHOTOS).await }).await?;
+    hub.emit(ServerEvent::Changed { tv: tv.name.clone() });
     Ok(StatusCode::NO_CONTENT)
-}
-
-#[derive(Deserialize, Default)]
-struct SyncBody {
-    #[serde(default)]
-    delete: bool,
 }
 
 /// Start syncing the TV's folder; progress arrives as events.
@@ -1230,11 +1204,11 @@ async fn sync_folder(
     State(hub): State<Shared>,
     headers: HeaderMap,
     UrlPath(name): UrlPath<String>,
-    body: Option<Json<SyncBody>>,
+    body: Option<Json<api::SyncRequest>>,
 ) -> ApiResult<StatusCode> {
     hub.require_admin(&headers)?;
     let tv = hub.tv(&name)?;
-    let delete = body.is_some_and(|Json(b)| b.delete);
+    let delete = body.is_some_and(|Json(b)| b.delete.unwrap_or(false));
     let folder = tv
         .config()
         .folder
@@ -1251,33 +1225,39 @@ async fn sync_folder(
             let state_file = hub2.state_file(&tv);
             let mut state = TvState::load(&state_file)?;
             let plan = sync::plan(&local, &state, &on_tv, delete);
-            hub2.emit(
-                json!({"type": "sync-start", "tv": tv.name, "upload": plan.upload.len(), "delete": plan.delete.len()}),
-            );
+            hub2.emit(ServerEvent::SyncStart {
+                tv: tv.name.clone(),
+                upload: plan.upload.len() as u32,
+                delete: plan.delete.len() as u32,
+            });
             let settings = upload_settings(&tv.config());
             let name = tv.name.clone();
             let outcome = sync::execute(&art, &mut state, &state_file, plan, &settings, |ev| match ev {
-                sync::SyncEvent::Uploading { index, total, path } => hub2.emit(json!({
-                    "type": "sync-progress", "tv": name, "index": index, "total": total,
-                    "name": path.file_name().map(|n| n.to_string_lossy().to_string()),
-                })),
-                sync::SyncEvent::UploadFailed { path, error } => hub2.emit(json!({
-                    "type": "error", "tv": name, "message": format!("{}: {error}", path.display()),
-                })),
+                sync::SyncEvent::Uploading { index, total, path } => hub2.emit(ServerEvent::SyncProgress {
+                    tv: name.clone(),
+                    index: index as u32,
+                    total: total as u32,
+                    name: path.file_name().map(|n| n.to_string_lossy().to_string()),
+                }),
+                sync::SyncEvent::UploadFailed { path, error } => {
+                    hub2.emit(ServerEvent::Error { tv: name.clone(), message: format!("{}: {error}", path.display()) });
+                }
                 _ => {}
             })
             .await?;
-            hub2.emit(json!({
-                "type": "sync-done", "tv": tv.name, "uploaded": outcome.uploaded.len(),
-                "deleted": outcome.deleted, "failed": outcome.failed,
-            }));
+            hub2.emit(ServerEvent::SyncDone {
+                tv: tv.name.clone(),
+                uploaded: outcome.uploaded.len() as u32,
+                deleted: outcome.deleted as u32,
+                failed: outcome.failed as u32,
+            });
             Ok(())
         }
         .await;
         if let Err(e) = result {
-            hub2.emit(json!({"type": "error", "tv": tv.name, "message": format!("sync: {e:#}")}));
+            hub2.emit(ServerEvent::Error { tv: tv.name.clone(), message: format!("sync: {e:#}") });
         }
-        hub2.emit(json!({"type": "changed", "tv": tv.name}));
+        hub2.emit(ServerEvent::Changed { tv: tv.name.clone() });
     });
     Ok(StatusCode::ACCEPTED)
 }
@@ -1294,18 +1274,13 @@ async fn wake(State(hub): State<Shared>, headers: HeaderMap, UrlPath(name): UrlP
     Ok(StatusCode::ACCEPTED)
 }
 
-#[derive(Deserialize)]
-struct ShareCardBody {
-    url: String,
-}
-
 /// Put a "scan me" QR code on the TV that opens this TV's guest upload page.
 async fn share_card(
     State(hub): State<Shared>,
     headers: HeaderMap,
     UrlPath(name): UrlPath<String>,
-    Json(b): Json<ShareCardBody>,
-) -> ApiResult<Json<Value>> {
+    Json(b): Json<api::ShareCardRequest>,
+) -> ApiResult<Json<api::ShareCard>> {
     hub.require_admin(&headers)?;
     let tv = hub.tv(&name)?;
     let (w, h) = tv.config().panel_size();
@@ -1325,8 +1300,8 @@ async fn share_card(
         async move { a.select_image(&id, None, true).await }
     })
     .await?;
-    hub.emit(json!({"type": "changed", "tv": tv.name}));
-    Ok(Json(json!({"content_id": id})))
+    hub.emit(ServerEvent::Changed { tv: tv.name.clone() });
+    Ok(Json(api::ShareCard { content_id: id }))
 }
 
 /// A full-screen image with a large QR code on a white card, for the TV.

@@ -16,6 +16,7 @@ use samsung_frame::protocol::category;
 use samsung_frame::sync::{self, SyncEvent, TvState, UploadSettings};
 use samsung_frame::{discovery, pairing, remote, rest, wol};
 
+mod api;
 mod serve;
 
 #[derive(Parser)]

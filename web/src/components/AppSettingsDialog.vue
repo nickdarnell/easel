@@ -2,7 +2,7 @@
 // Server-wide settings, stored in the config folder.
 import { computed, ref } from "vue";
 import ModalDialog from "./ModalDialog.vue";
-import type { Info, Settings } from "../types";
+import type { Info, Settings, SettingsUpdate } from "../types";
 import { S, act, api, closeDialog } from "../state";
 import { toast } from "../toasts";
 import { store } from "../util";
@@ -21,7 +21,7 @@ const aliases = computed(() => s.localsend_targets.map((t) => `“${t.alias}”`
 
 const save = () =>
   act(async () => {
-    const body: Record<string, unknown> = {
+    const body: SettingsUpdate = {
       public_url: publicUrl.value.trim(),
       localsend: localsend.value,
       localsend_pin: pin.value.trim(),

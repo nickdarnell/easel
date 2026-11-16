@@ -3,6 +3,7 @@ import { ref } from "vue";
 import ModalDialog from "./ModalDialog.vue";
 import { S, act, api, closeDialog, isAdmin, shareUrl, tvPath } from "../state";
 import { toast } from "../toasts";
+import type { ShareCardRequest } from "../types";
 import { enc } from "../util";
 
 const tv = S.tv!;
@@ -23,7 +24,7 @@ async function copy() {
 async function showOnTv() {
   sending.value = true;
   await act(async () => {
-    await api(tvPath(tv, "/share-card"), { json: { url } });
+    await api(tvPath(tv, "/share-card"), { json: { url } satisfies ShareCardRequest });
     toast("Scan the TV with your phone camera");
     closeDialog();
   });

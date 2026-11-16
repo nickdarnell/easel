@@ -1,6 +1,6 @@
 // State for the framing composer: choosing how photos sit on the TV before sending (or reframing one).
 import { ref } from "vue";
-import type { Photo, Tv } from "./types";
+import type { Framing, Photo, Tv } from "./types";
 import { type Frameable, frameDefaults, framingOf, panelAspect, setFromCrop } from "./framing";
 import { S, act, api, curTv, dialog, loadPhotos, loadStatus, openDialog, closeDialog, tvPath } from "./state";
 import { toast } from "./toasts";
@@ -171,7 +171,7 @@ export async function saveReframe(c: Composer) {
   const f = framingOf(c.items[0]!, c.pa);
   if (!f) return;
   await act(async () => {
-    await api(tvPath(S.tv!, `/photos/${enc(c.photo!.id)}/reframe`), { json: f });
+    await api(tvPath(S.tv!, `/photos/${enc(c.photo!.id)}/reframe`), { json: f satisfies Framing });
     closeDialog();
     toast("Reframed");
     loadPhotos();

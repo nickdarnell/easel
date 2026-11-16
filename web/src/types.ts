@@ -1,116 +1,35 @@
-// Shapes of the JSON the server (src/bin/frametv/serve.rs) sends.
+// The server's API types are generated from the Rust code (src/bin/frametv/api.rs) into ./api
+// by `cargo test`; don't edit those by hand. This re-exports them, plus a few UI-only types.
 
-export type Power = "on" | "standby" | "off";
+export type * from "./api/AddTv";
+export type * from "./api/Crop";
+export type * from "./api/Current";
+export type * from "./api/Deleted";
+export type * from "./api/Discovered";
+export type * from "./api/ErrorBody";
+export type * from "./api/Fit";
+export type * from "./api/Framing";
+export type * from "./api/Info";
+export type * from "./api/LocalSendTarget";
+export type * from "./api/MatteList";
+export type * from "./api/MatteUpdate";
+export type * from "./api/Paired";
+export type * from "./api/Photo";
+export type * from "./api/Power";
+export type * from "./api/Reframed";
+export type * from "./api/ServerEvent";
+export type * from "./api/Settings";
+export type * from "./api/SettingsUpdate";
+export type * from "./api/ShareCard";
+export type * from "./api/ShareCardRequest";
+export type * from "./api/Slideshow";
+export type * from "./api/SlideshowUpdate";
+export type * from "./api/Status";
+export type * from "./api/SyncRequest";
+export type * from "./api/Toggle";
+export type * from "./api/Tv";
+export type * from "./api/TvUpdate";
+export type * from "./api/Uploaded";
 
-export interface LocalSendTarget {
-  alias: string;
-  port: number;
-}
-
-export interface Info {
-  admin: boolean;
-  password_set: boolean;
-  public_url: string | null;
-  localsend: LocalSendTarget[];
-  heif: boolean;
-  version: string;
-}
-
-export interface Settings {
-  password_set: boolean;
-  public_url: string | null;
-  localsend: boolean;
-  localsend_pin: string | null;
-  show_on_receive: boolean;
-  localsend_targets: LocalSendTarget[];
-  localsend_error: string | null;
-  in_docker: boolean;
-}
-
-export type Fit = "cover" | "contain" | "original";
-
-export interface Tv {
-  name: string;
-  host: string;
-  model: string | null;
-  resolution: [number, number] | null;
-  folder: string | null;
-  matte: string | null;
-  portrait_matte: string | null;
-  fit: Fit | null;
-  power: Power;
-  can_wake: boolean;
-}
-
-export interface Status {
-  artmode: boolean | null;
-  current: { content_id: string } | null;
-  slideshow: { minutes: number; shuffle: boolean } | null;
-}
-
-export interface Crop {
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-}
-
-/** How a photo sits on the screen. `matte` of `none`/`auto`/missing means the TV's default. */
-export interface Framing {
-  fit: Fit;
-  crop?: Crop | null;
-  matte?: string | null;
-}
-
-export interface Photo {
-  id: string;
-  width: number | null;
-  height: number | null;
-  date: string | null;
-  matte: string | null;
-  portrait_matte: string | null;
-  mine: boolean;
-  source: string | null;
-  framing: Framing | null;
-  reframe: boolean;
-  thumb: boolean;
-}
-
-export interface Mattes {
-  types: string[];
-  colors: string[];
-}
-
-export interface Discovered {
-  host: string;
-  name: string;
-  model: string | null;
-  frame: boolean;
-  power: Power;
-  paired: boolean;
-}
-
-export interface Paired {
-  name: string;
-  photos: number | null;
-  frame: boolean;
-}
-
-export interface UploadResult {
-  duplicate?: boolean;
-  shown?: boolean;
-}
-
+/** The photo grid's filter. */
 export type Filter = "all" | "mine" | "favorites";
-
-/** Server-sent events from `/api/events`. */
-export type ServerEvent =
-  | { type: "thumbs"; tv: string; ids: string[] }
-  | { type: "uploaded" | "changed"; tv: string }
-  | { type: "sync-done"; tv: string; uploaded: number; deleted: number; failed: number }
-  | { type: "sync-start"; tv: string; upload: number }
-  | { type: "sync-progress"; tv: string; index: number; total: number }
-  | { type: "tv-event"; tv: string }
-  | { type: "tvs-changed" | "settings-changed"; tv?: undefined }
-  | { type: "error"; tv: string; message: string }
-  | { type: "uploading"; tv: string };

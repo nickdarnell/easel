@@ -14,7 +14,7 @@ function soon(key: string, fn: () => unknown, ms = 600) {
 let syncToast: ToastHandle | null = null;
 
 function handle(e: ServerEvent) {
-  const here = e.tv === S.tv;
+  const here = "tv" in e && e.tv === S.tv;
   switch (e.type) {
     case "thumbs":
       if (here) thumbsArrived(e.ids);
