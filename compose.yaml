@@ -8,6 +8,7 @@ services:
     # Host networking lets the app find TVs, wake them, and show up in LocalSend.
     network_mode: host
     environment:
+      PORT: 3273   # the web app's port (host networking, so no ports: mapping)
       PUID: 1000   # user and group that own ./config (see `id -u`, `id -g`)
       PGID: 1000
     volumes:

@@ -16,9 +16,11 @@ Rust library and the `frametv` command.
 services:
   easel:
     image: ghcr.io/nickdarnell/easel:latest
+    container_name: easel
     restart: unless-stopped
     network_mode: host
     environment:
+      PORT: 3273   # the web app's port
       PUID: 1000   # the user and group that own ./config
       PGID: 1000
     volumes:
@@ -33,12 +35,14 @@ Or with plain Docker:
 
 ```sh
 docker run -d --name easel --restart unless-stopped --network host \
-  -e PUID=1000 -e PGID=1000 -v ./config:/config ghcr.io/nickdarnell/easel:latest
+  -e PORT=3273 -e PUID=1000 -e PGID=1000 -v ./config:/config ghcr.io/nickdarnell/easel:latest
 ```
 
-`PUID` and `PGID` (both default to 1000) set the user and group the app runs as. Use the output
-of `id -u` and `id -g` for whoever should own `./config`. Everything else is configured in the
-web page and saved in `/config`:
+`PORT` (default 3273) is the port the web app listens on. With host networking there's no
+`ports:` mapping, so change `PORT` if something else already uses 3273. `PUID` and `PGID`
+(both default to 1000) set the user and group the app runs as. Use the output of `id -u` and
+`id -g` for whoever should own `./config`. Everything else is configured in the web page and
+saved in `/config`:
 
 1. Open `http://<server-ip>:3273`.
 2. Choose **Add TV** and pick your TV (or type its IP). **The TV asks whether to allow
@@ -63,10 +67,6 @@ To build the image yourself instead of pulling it, run `docker compose up -d --b
 
 On start, the container hands `/config` to `PUID:PGID` if anyone else owns it.
 
-The web app listens on port **3273**. If something else already uses it, add
-`command: ["--port", "8790"]` to the service (or put `--port 8790` after the image name with
-`docker run`).
-
 **Forgot the password?** Delete the `admin_password` line under `[server]` in
 `config/config.toml` and restart the container.
 
@@ -81,7 +81,9 @@ announcements, and it means share links show the server's real address. Host net
 a Linux Docker host (a home server, NAS, or Raspberry Pi). On Docker Desktop for
 Windows/macOS, host mode is limited, so expect to type TV IPs and miss Wake‑on‑LAN.
 
-Bridge networking (`-p 3273:3273 -p 53317:53317 -p 53317:53317/udp`) also works if you must.
+Bridge networking (`ports: ["3273:3273", "53317:53317", "53317:53317/udp"]` instead of
+`network_mode: host`, or `-p` with `docker run`) also works if you must. Leave `PORT` alone
+then and change the left-hand side of the mapping instead.
 Pairing by IP and uploads work, but discovery, Wake‑on‑LAN and LocalSend discovery don't. Set
 the **share address** in App settings so QR codes don't point at the container's private
 address.
