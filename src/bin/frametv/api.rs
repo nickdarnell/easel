@@ -40,7 +40,10 @@ pub struct Info {
     pub localsend: Vec<LocalSendTarget>,
     /// Whether the server can read HEIC photos itself (otherwise the browser converts them).
     pub heif: bool,
+    /// The app's version (from Cargo.toml).
     pub version: String,
+    /// The short hash of the commit this build came from, if known.
+    pub commit: Option<String>,
 }
 
 /// `GET /api/settings` (admin): the server-wide settings.

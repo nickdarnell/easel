@@ -974,6 +974,10 @@ pub async fn run(cfg: Config, cfg_path: PathBuf, state_dir: PathBuf, opts: Serve
         .await
         .with_context(|| format!("could not listen on port {} (busy? try --port)", opts.port))?;
     let settings = hub.server_settings();
+    match commit() {
+        Some(c) => println!("Easel {} (commit {c})", env!("CARGO_PKG_VERSION")),
+        None => println!("Easel {}", env!("CARGO_PKG_VERSION")),
+    }
     println!("Frame TV web app:  http://localhost:{}", opts.port);
     if let Some(url) = &settings.public_url {
         println!("  for guests:      {url}");
@@ -1115,7 +1119,13 @@ async fn info(State(hub): State<Shared>, headers: HeaderMap) -> Json<api::Info> 
         localsend: hub.localsend.lock().unwrap().clone(),
         heif: image_prep::heif_supported(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
+        commit: commit().map(str::to_owned),
     })
+}
+
+/// The commit this build came from, if known (see build.rs).
+fn commit() -> Option<&'static str> {
+    Some(env!("EASEL_COMMIT")).filter(|c| !c.is_empty())
 }
 
 fn settings(hub: &Hub) -> api::Settings {

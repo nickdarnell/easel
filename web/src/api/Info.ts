@@ -16,4 +16,12 @@ public_url: string | null, localsend: Array<LocalSendTarget>,
 /**
  * Whether the server can read HEIC photos itself (otherwise the browser converts them).
  */
-heif: boolean, version: string, };
+heif: boolean, 
+/**
+ * The app's version (from Cargo.toml).
+ */
+version: string, 
+/**
+ * The short hash of the commit this build came from, if known.
+ */
+commit: string | null, };

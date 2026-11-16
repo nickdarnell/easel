@@ -31,6 +31,8 @@ RUN mkdir -p src/bin/frametv \
 COPY build.rs ./
 COPY src ./src
 COPY --from=web /web/dist ./web/dist
+# The commit being built, shown in the web page and the log (CI passes it; .git isn't copied in).
+ARG EASEL_COMMIT=""
 RUN find build.rs src web -type f -exec touch {} + \
  && cargo build --release --locked --bin frametv \
  && cp target/release/frametv /usr/local/bin/frametv

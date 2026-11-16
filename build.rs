@@ -1,9 +1,14 @@
 //! Embeds the built web UI (`web/dist`, from `npm run build` in `web/`) into the `frametv` binary.
 //!
 //! Without a build, a placeholder page is embedded instead, so the Rust code builds and tests without Node.
+//!
+//! Also records which commit is being built (`EASEL_COMMIT`), so the web page and the log can say
+//! exactly which build is running: from the `EASEL_COMMIT` environment variable (the Docker build
+//! gets it from CI), or else from git.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::{env, fs};
 
 const PLACEHOLDER: &str = "<!doctype html><meta charset=utf-8><title>Easel</title>\
@@ -35,6 +40,31 @@ fn main() {
     }
     code.push_str("];\n");
     fs::write(out.join("web_files.rs"), code).unwrap();
+
+    println!("cargo:rustc-env=EASEL_COMMIT={}", commit(&manifest));
+}
+
+/// The short hash of the commit being built, or "" if nobody knows.
+fn commit(manifest: &Path) -> String {
+    println!("cargo:rerun-if-env-changed=EASEL_COMMIT");
+    if let Some(sha) = env::var("EASEL_COMMIT").ok().filter(|s| !s.trim().is_empty()) {
+        return sha.trim().chars().take(7).collect();
+    }
+    // Re-run after commits and checkouts (both append to logs/HEAD).
+    for f in ["HEAD", "logs/HEAD"] {
+        let path = manifest.join(".git").join(f);
+        if path.exists() {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+    Command::new("git")
+        .args(["rev-parse", "--short=7", "HEAD"])
+        .current_dir(manifest)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .unwrap_or_default()
 }
 
 fn collect(root: &Path, dir: &Path, files: &mut Vec<(String, PathBuf)>) {

@@ -1,6 +1,6 @@
 [package]
 name = "samsung-frame"
-version = "0.1.0"
+version = "0.2.0"
 description = "Manage Samsung The Frame TV art mode (upload, sync, slideshow, mattes) from Rust"
 license = "MIT"
 repository = "https://github.com/nickdarnell/easel"

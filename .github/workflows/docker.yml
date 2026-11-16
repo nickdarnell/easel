@@ -79,6 +79,11 @@ jobs:
           echo "full=$v" >> "$GITHUB_OUTPUT"
           echo "minor=${v%.*}" >> "$GITHUB_OUTPUT"
           echo "major=${v%%.*}" >> "$GITHUB_OUTPUT"
+          # A release tag must match: v0.2.0 is only for a build whose Cargo.toml says 0.2.0.
+          if [[ "$GITHUB_REF" == refs/tags/v* && "${GITHUB_REF#refs/tags/v}" != "$v" ]]; then
+            echo "::error::tag ${GITHUB_REF#refs/tags/} doesn't match Cargo.toml's version $v"
+            exit 1
+          fi
       - id: meta
         uses: docker/metadata-action@v5
         with:
@@ -110,6 +115,7 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: EASEL_COMMIT=${{ github.sha }}
           # Layer cache, including the compiled-dependencies layer (see Dockerfile).
           cache-from: type=gha
           cache-to: type=gha,mode=max

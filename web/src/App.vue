@@ -162,6 +162,15 @@ onMounted(async () => {
         <PhotoGrid :tv="curTv" />
       </template>
     </template>
+    <footer v-if="S.info" class="version">
+      Easel {{ S.info.version }}
+      <template v-if="S.info.commit">
+        ·
+        <a :href="`https://github.com/nickdarnell/easel/commit/${S.info.commit}`" target="_blank" rel="noopener">{{
+          S.info.commit
+        }}</a>
+      </template>
+    </footer>
   </main>
 
   <div v-if="dragDepth > 0" class="drop">
