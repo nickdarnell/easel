@@ -12,7 +12,8 @@ pub fn parse_mac(mac: &str) -> Result<[u8; 6]> {
     }
     let mut out = [0u8; 6];
     for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).map_err(|_| Error::Other(format!("invalid MAC `{mac}`")))?;
+        *byte =
+            u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).map_err(|_| Error::Other(format!("invalid MAC `{mac}`")))?;
     }
     Ok(out)
 }
