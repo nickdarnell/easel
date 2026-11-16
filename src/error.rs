@@ -31,7 +31,9 @@ pub enum Error {
     Unauthorized,
 
     /// `ms.channel.timeOut`: the token is missing or wrong, or nobody pressed Allow in time.
-    #[error("the TV did not accept the connection (ms.channel.timeOut); the token is missing or stale, or Allow was not pressed. Run `frametv pair`")]
+    #[error(
+        "the TV did not accept the connection (ms.channel.timeOut); the token is missing or stale, or Allow was not pressed. Run `frametv pair`"
+    )]
     ChannelTimeout,
 
     /// The art app answered a request with an `error` event.

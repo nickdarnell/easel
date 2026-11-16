@@ -273,7 +273,9 @@ impl App {
         }
         match self.cfg.tvs.as_slice() {
             [only] => Ok(vec![only.clone()]),
-            _ => bail!("several TVs configured; pick with --tv <name> or --all (or set one with `configure <tv> --default`)"),
+            _ => bail!(
+                "several TVs configured; pick with --tv <name> or --all (or set one with `configure <tv> --default`)"
+            ),
         }
     }
 
@@ -291,7 +293,8 @@ impl App {
             wake_and_wait(tv).await?;
         }
         let endpoint = tv.endpoint(&self.cfg.client_name);
-        let art = ArtClient::connect(&endpoint).await.with_context(|| format!("connecting to {} ({})", tv.name, tv.host))?;
+        let art =
+            ArtClient::connect(&endpoint).await.with_context(|| format!("connecting to {} ({})", tv.name, tv.host))?;
         if let Some(token) = art.issued_token()
             && tv.token.as_deref() != Some(token)
             && let Some(stored) = self.cfg.find_mut(&tv.name)
@@ -306,7 +309,13 @@ impl App {
         sync::state_path(&self.state_dir, &tv.name)
     }
 
-    fn upload_settings(&self, tv: &TvConfig, fit: Option<Fit>, matte: Option<String>, portrait: Option<String>) -> Result<UploadSettings> {
+    fn upload_settings(
+        &self,
+        tv: &TvConfig,
+        fit: Option<Fit>,
+        matte: Option<String>,
+        portrait: Option<String>,
+    ) -> Result<UploadSettings> {
         let fit = match fit {
             Some(f) => f,
             None => tv.fit.as_deref().map(str::parse).transpose().map_err(|e: String| anyhow!(e))?.unwrap_or_default(),
@@ -329,7 +338,10 @@ async fn wake_and_wait(tv: &TvConfig) -> Result<()> {
     if rest::device_info(&tv.host, Duration::from_secs(2)).await.is_ok_and(|i| i.power_state() == "on") {
         return Ok(());
     }
-    let mac = tv.mac.as_deref().ok_or_else(|| anyhow!("{} has no MAC address configured (`configure {} --mac ..`)", tv.name, tv.name))?;
+    let mac = tv
+        .mac
+        .as_deref()
+        .ok_or_else(|| anyhow!("{} has no MAC address configured (`configure {} --mac ..`)", tv.name, tv.name))?;
     eprintln!("waking {}...", tv.name);
     for _ in 0..20 {
         wol::wake(mac, Some(&tv.host))?;
@@ -458,7 +470,8 @@ async fn run(cli: Cli) -> Result<()> {
             let old_name = entry.name.clone();
             if let Some(n) = rename {
                 entry.name = n;
-                let (old, new) = (sync::state_path(&app.state_dir, &old_name), sync::state_path(&app.state_dir, &entry.name));
+                let (old, new) =
+                    (sync::state_path(&app.state_dir, &old_name), sync::state_path(&app.state_dir, &entry.name));
                 if old.exists() {
                     std::fs::rename(old, new)?;
                 }
@@ -538,7 +551,14 @@ async fn run(cli: Cli) -> Result<()> {
                         Ok(r) => {
                             state.record(&r.content_id, &sync::hash_file(path)?, path);
                             state.save(&state_file)?;
-                            eprintln!("{} ({}x{}, {} KB, matte {})", r.content_id, r.width, r.height, r.bytes / 1024, r.matte);
+                            eprintln!(
+                                "{} ({}x{}, {} KB, matte {})",
+                                r.content_id,
+                                r.width,
+                                r.height,
+                                r.bytes / 1024,
+                                r.matte
+                            );
                             if app.json {
                                 println!("{}", json!({"tv": tv.name, "path": path, "content_id": r.content_id}));
                             }
@@ -555,10 +575,13 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Sync { folder, delete, dry_run, fit, matte, portrait_matte } => {
             for tv in app.select(&keys, all)? {
-                let folder = folder
-                    .clone()
-                    .or_else(|| tv.folder.clone())
-                    .ok_or_else(|| anyhow!("no folder given and none configured for {} (`configure {} --folder <dir>`)", tv.name, tv.name))?;
+                let folder = folder.clone().or_else(|| tv.folder.clone()).ok_or_else(|| {
+                    anyhow!(
+                        "no folder given and none configured for {} (`configure {} --folder <dir>`)",
+                        tv.name,
+                        tv.name
+                    )
+                })?;
                 run_sync(&mut app, &tv, &folder, delete, dry_run, fit, matte.clone(), portrait_matte.clone()).await?;
             }
             Ok(())
@@ -594,15 +617,14 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Artmode { state } => {
             for tv in app.select(&keys, all)? {
                 let art = app.connect(&tv).await?;
-                match state {
-                    Some(s) => art.set_artmode(matches!(s, OnOff::On)).await?,
-                    None => {
-                        let on = art.artmode().await?;
-                        if app.json {
-                            println!("{}", json!({"tv": tv.name, "artmode": on}));
-                        } else {
-                            println!("{}: art mode {}", tv.name, if on { "on" } else { "off" });
-                        }
+                if let Some(s) = state {
+                    art.set_artmode(matches!(s, OnOff::On)).await?;
+                } else {
+                    let on = art.artmode().await?;
+                    if app.json {
+                        println!("{}", json!({"tv": tv.name, "artmode": on}));
+                    } else {
+                        println!("{}: art mode {}", tv.name, if on { "on" } else { "off" });
                     }
                 }
             }
@@ -631,11 +653,7 @@ async fn run(cli: Cli) -> Result<()> {
                         }
                     }
                     Some(v) => {
-                        let minutes = if v.eq_ignore_ascii_case("off") {
-                            None
-                        } else {
-                            Some(parse_interval(v)?)
-                        };
+                        let minutes = if v.eq_ignore_ascii_case("off") { None } else { Some(parse_interval(v)?) };
                         art.set_slideshow(minutes, !sequential, &cat).await?;
                     }
                 }
@@ -664,7 +682,9 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Filters => {
             let tv = app.select_one(&keys, all)?;
             let f = app.connect(&tv).await?.photo_filters().await?;
-            if app.json { app.print_json(&f) } else {
+            if app.json {
+                app.print_json(&f)
+            } else {
                 println!("{}", f.join(", "));
                 Ok(())
             }
@@ -730,7 +750,11 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Key { key, hold } => {
-            let key = if key.to_ascii_uppercase().starts_with("KEY_") { key.to_ascii_uppercase() } else { format!("KEY_{}", key.to_ascii_uppercase()) };
+            let key = if key.to_ascii_uppercase().starts_with("KEY_") {
+                key.to_ascii_uppercase()
+            } else {
+                format!("KEY_{}", key.to_ascii_uppercase())
+            };
             for tv in app.select(&keys, all)? {
                 let mut rc = remote::RemoteClient::connect(&tv.endpoint(&app.cfg.client_name)).await?;
                 match hold {
@@ -925,7 +949,11 @@ async fn status(app: &mut App, tv: &TvConfig) -> Value {
         if !app.json {
             match s.minutes {
                 None => println!("  slideshow   off"),
-                Some(m) => println!("  slideshow   {} every {}", if s.shuffle { "shuffle" } else { "in order" }, human_minutes(m)),
+                Some(m) => println!(
+                    "  slideshow   {} every {}",
+                    if s.shuffle { "shuffle" } else { "in order" },
+                    human_minutes(m)
+                ),
             }
         }
         v["slideshow_minutes"] = json!(s.minutes);
@@ -955,7 +983,8 @@ async fn run_sync(
     let local = tokio::task::spawn_blocking(move || sync::scan_folder(&folder_owned)).await??;
 
     let art = app.connect(tv).await?;
-    let on_tv: HashSet<String> = art.content_list(Some(category::MY_PHOTOS)).await?.into_iter().map(|i| i.content_id).collect();
+    let on_tv: HashSet<String> =
+        art.content_list(Some(category::MY_PHOTOS)).await?.into_iter().map(|i| i.content_id).collect();
     let state_file = app.state_file(tv);
     let mut state = TvState::load(&state_file)?;
     let plan = sync::plan(&local, &state, &on_tv, delete);
@@ -985,7 +1014,13 @@ async fn run_sync(
             eprint!("  [{}/{}] {} ... ", index + 1, total, path.file_name().unwrap_or_default().to_string_lossy());
         }
         SyncEvent::Uploaded { result, .. } => {
-            eprintln!("{} ({}x{}{})", result.content_id, result.width, result.height, if result.cropped { ", cropped" } else { "" });
+            eprintln!(
+                "{} ({}x{}{})",
+                result.content_id,
+                result.width,
+                result.height,
+                if result.cropped { ", cropped" } else { "" }
+            );
         }
         SyncEvent::UploadFailed { error, .. } => eprintln!("failed: {error}"),
         SyncEvent::Deleted { content_id, source } => eprintln!("  deleted {content_id} ({})", source.display()),

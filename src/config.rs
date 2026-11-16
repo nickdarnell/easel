@@ -33,7 +33,12 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { client_name: default_client_name(), default_tv: None, server: ServerSettings::default(), tvs: Vec::new() }
+        Self {
+            client_name: default_client_name(),
+            default_tv: None,
+            server: ServerSettings::default(),
+            tvs: Vec::new(),
+        }
     }
 }
 
@@ -192,9 +197,7 @@ pub fn default_config_path() -> PathBuf {
     if let Some(d) = data_dir_override() {
         return d.join("config.toml");
     }
-    project_dirs()
-        .map(|d| d.config_dir().join("config.toml"))
-        .unwrap_or_else(|| PathBuf::from("frametv.toml"))
+    project_dirs().map_or_else(|| PathBuf::from("frametv.toml"), |d| d.config_dir().join("config.toml"))
 }
 
 /// Where per-TV sync state lives.
@@ -202,9 +205,7 @@ pub fn default_state_dir() -> PathBuf {
     if let Some(d) = data_dir_override() {
         return d.join("state");
     }
-    project_dirs()
-        .map(|d| d.data_dir().join("state"))
-        .unwrap_or_else(|| PathBuf::from("frametv-state"))
+    project_dirs().map_or_else(|| PathBuf::from("frametv-state"), |d| d.data_dir().join("state"))
 }
 
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {

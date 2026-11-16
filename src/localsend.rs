@@ -114,7 +114,8 @@ struct DeviceState {
 
 /// Which offered files to accept: by default, anything that looks like an image.
 pub fn accept_images(file_name: &str, mime: Option<&str>) -> bool {
-    mime.is_some_and(|m| m.starts_with("image/")) || crate::image_prep::is_supported_or_heif_path(std::path::Path::new(file_name))
+    mime.is_some_and(|m| m.starts_with("image/"))
+        || crate::image_prep::is_supported_or_heif_path(std::path::Path::new(file_name))
 }
 
 /// A running receiver.
@@ -193,7 +194,7 @@ fn router(state: Arc<DeviceState>) -> Router {
 
 async fn register(State(s): State<Arc<DeviceState>>, body: Option<Json<Value>>) -> Json<Value> {
     if let Some(Json(b)) = body {
-        let alias = b.get("alias").and_then(serde_json::Value::as_str).unwrap_or("?").to_string();
+        let alias = b.get("alias").and_then(Value::as_str).unwrap_or("?").to_string();
         tracing::debug!("LocalSend register from {alias}");
     }
     Json(s.device.info(s.port))
@@ -311,10 +312,8 @@ async fn cancel(State(s): State<Arc<DeviceState>>, Query(q): Query<CancelQuery>)
 /// Keep only the final path component and strip characters Windows rejects.
 pub fn sanitize_file_name(name: &str) -> String {
     let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
-    let clean: String = base
-        .chars()
-        .map(|c| if c.is_control() || r#"<>:"|?*"#.contains(c) { '_' } else { c })
-        .collect();
+    let clean: String =
+        base.chars().map(|c| if c.is_control() || r#"<>:"|?*"#.contains(c) { '_' } else { c }).collect();
     let clean = clean.trim().trim_matches('.').to_string();
     if clean.is_empty() { "image".into() } else { clean }
 }

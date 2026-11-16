@@ -17,22 +17,17 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
-    # Same Debian as the image, so libheif matches what ships.
-    container: rust:1-slim-trixie
     steps:
       - uses: actions/checkout@v4
       - name: System libraries
         run: |
-          apt-get update
-          apt-get install -y --no-install-recommends pkg-config libssl-dev libheif-dev libheif-plugin-libde265
-      - uses: actions/cache@v4
-        with:
-          path: |
-            /usr/local/cargo/registry
-            target
-          key: cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-
-      - run: rustup component add clippy
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev libheif-dev
+      # rustup picks up rust-toolchain.toml: the stable channel with rustfmt and clippy.
+      - run: rustup show active-toolchain
+      # Caches the cargo registry and compiled dependencies (keyed on Cargo.lock + rustc version).
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
 
@@ -67,5 +62,6 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Layer cache, including the compiled-dependencies layer (see Dockerfile).
           cache-from: type=gha
           cache-to: type=gha,mode=max

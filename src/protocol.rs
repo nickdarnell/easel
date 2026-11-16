@@ -39,11 +39,7 @@ pub mod category {
 
 /// Wrap IPv6 literals in brackets for URLs.
 pub fn format_host(host: &str) -> String {
-    if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]")
-    } else {
-        host.to_string()
-    }
+    if host.contains(':') && !host.starts_with('[') { format!("[{host}]") } else { host.to_string() }
 }
 
 pub fn channel_url(host: &str, port: u16, channel: &str, client_name: &str, token: Option<&str>) -> String {

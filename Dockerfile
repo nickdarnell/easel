@@ -7,10 +7,22 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends pkg-config libssl-dev libheif-dev \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
-COPY . .
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
-    cargo build --release --locked --bin frametv \
+
+# Dependencies first, in their own layer: it only rebuilds when Cargo.toml/Cargo.lock change,
+# and CI keeps it in the GitHub Actions cache. (No cache mounts: those aren't kept between CI
+# runners, and the layer must hold everything the second build needs.)
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir -p src/bin/frametv \
+ && echo 'fn main() {}' > src/bin/frametv/main.rs \
+ && touch src/lib.rs \
+ && cargo build --release --locked --bin frametv \
+ && rm -rf src
+
+# Then the app itself. Touch the sources so cargo rebuilds them over the placeholder build
+# (COPY keeps the files' original, possibly older, timestamps).
+COPY src ./src
+RUN find src -type f -exec touch {} + \
+ && cargo build --release --locked --bin frametv \
  && cp target/release/frametv /usr/local/bin/frametv
 
 FROM debian:trixie-slim

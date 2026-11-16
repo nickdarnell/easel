@@ -189,12 +189,9 @@ impl Router {
                 return;
             }
         }
-        let data = match json_field(&incoming.json, "data") {
-            Some(d) => d,
-            None => {
-                tracing::debug!("d2d message without data: {}", incoming.json);
-                return;
-            }
+        let Some(data) = json_field(&incoming.json, "data") else {
+            tracing::debug!("d2d message without data: {}", incoming.json);
+            return;
         };
         let event = data.get("event").and_then(Value::as_str).unwrap_or("*").to_string();
         let request_id = str_field(&data, "request_id").or_else(|| str_field(&data, "id"));
@@ -398,9 +395,10 @@ impl ArtClient {
             }
         })
         .await;
-        match ready {
-            Ok(r) => r?,
-            Err(_) => tracing::warn!("{}: art channel never sent ms.channel.ready; continuing anyway", endpoint.host),
+        if let Ok(r) = ready {
+            r?;
+        } else {
+            tracing::warn!("{}: art channel never sent ms.channel.ready; continuing anyway", endpoint.host);
         }
 
         let (sink, stream) = ws.split();
@@ -459,9 +457,14 @@ impl ArtClient {
 
     /// Send a raw art request and wait for its reply. `id`/`request_id` are filled in.
     /// With `wait_event`, waits for that sub-event instead of the first reply.
-    pub async fn request_with(&self, mut request: Value, wait_event: Option<&str>, timeout: Duration) -> Result<ArtMessage> {
+    pub async fn request_with(
+        &self,
+        mut request: Value,
+        wait_event: Option<&str>,
+        timeout: Duration,
+    ) -> Result<ArtMessage> {
         let obj = request.as_object_mut().ok_or_else(|| Error::Other("art request must be a JSON object".into()))?;
-        let id = obj.get("id").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(new_id);
+        let id = obj.get("id").and_then(Value::as_str).map_or_else(new_id, str::to_owned);
         obj.insert("id".into(), json!(id));
         obj.insert("request_id".into(), json!(id));
         let name = obj.get("request").and_then(Value::as_str).unwrap_or("?").to_string();
@@ -499,12 +502,11 @@ impl ArtClient {
             Err(Error::Art { .. } | Error::Timeout(..)) => None,
             Err(e) => return Err(e),
         };
-        let version = match first {
-            Some(v) => v,
-            None => {
-                let m = self.request(json!({"request": "get_api_version"})).await?;
-                str_field(&m.data, "version").ok_or_else(|| Error::protocol("api version reply has no version"))?
-            }
+        let version = if let Some(v) = first {
+            v
+        } else {
+            let m = self.request(json!({"request": "get_api_version"})).await?;
+            str_field(&m.data, "version").ok_or_else(|| Error::protocol("api version reply has no version"))?
         };
         *self.api_version.lock().unwrap() = Some(version.clone());
         Ok(version)
@@ -591,7 +593,8 @@ impl ArtClient {
         if self.is_legacy_api().await {
             return self.upload_legacy(image, &file_type, opts).await;
         }
-        let date = opts.image_date.clone().unwrap_or_else(|| chrono::Local::now().format("%Y:%m:%d %H:%M:%S").to_string());
+        let date =
+            opts.image_date.clone().unwrap_or_else(|| chrono::Local::now().format("%Y:%m:%d %H:%M:%S").to_string());
         let id = new_id();
         // id, request_id and conn_info.id must all be the same.
         let request = json!({
@@ -629,8 +632,10 @@ impl ArtClient {
         stream.flush().await?;
         let _ = stream.shutdown().await;
 
-        let added = check_error(confirm.wait(opts.confirm_timeout, "upload confirmation (image_added)").await?, "send_image")?;
-        str_field(&added.data, "content_id").ok_or_else(|| Error::protocol(format!("image_added without content_id: {}", added.data)))
+        let added =
+            check_error(confirm.wait(opts.confirm_timeout, "upload confirmation (image_added)").await?, "send_image")?;
+        str_field(&added.data, "content_id")
+            .ok_or_else(|| Error::protocol(format!("image_added without content_id: {}", added.data)))
     }
 
     async fn upload_legacy(&self, image: &[u8], file_type: &str, opts: &UploadOptions) -> Result<String> {
@@ -710,7 +715,7 @@ impl ArtClient {
                 Ok(mut files) => {
                     for f in &mut files {
                         if f.content_id.is_empty() {
-                            f.content_id = id.clone();
+                            f.content_id.clone_from(id);
                         }
                     }
                     out.extend(files);
@@ -758,9 +763,7 @@ impl ArtClient {
         Ok(list
             .as_array()
             .map(|a| {
-                a.iter()
-                    .filter_map(|f| str_field(f, "filter_id").or_else(|| f.as_str().map(str::to_owned)))
-                    .collect()
+                a.iter().filter_map(|f| str_field(f, "filter_id").or_else(|| f.as_str().map(str::to_owned))).collect()
             })
             .unwrap_or_default())
     }
@@ -850,7 +853,9 @@ impl ArtClient {
         }
         // Art API 2.x: one request per setting.
         let mut out = Vec::new();
-        for item in ["brightness", "color_temperature", "motion_sensitivity", "motion_timer", "brightness_sensor_setting"] {
+        for item in
+            ["brightness", "color_temperature", "motion_sensitivity", "motion_timer", "brightness_sensor_setting"]
+        {
             match self.request(json!({"request": format!("get_{item}")})).await {
                 Ok(m) => out.push(ArtSetting {
                     item: item.to_string(),

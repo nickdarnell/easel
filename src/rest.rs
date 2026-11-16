@@ -59,12 +59,7 @@ impl DeviceInfo {
 
     /// Model year (2-digit, e.g. 22) from the internal model code; 0 if unknown.
     pub fn model_year(&self) -> u32 {
-        self.device
-            .model
-            .as_deref()
-            .and_then(|m| m.split('_').next())
-            .and_then(|y| y.parse().ok())
-            .unwrap_or(0)
+        self.device.model.as_deref().and_then(|m| m.split('_').next()).and_then(|y| y.parse().ok()).unwrap_or(0)
     }
 
     /// Panel resolution as (width, height).

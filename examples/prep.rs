@@ -19,7 +19,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::write(output, &p.data)?;
     println!(
         "{}x{} {} {} KB, reencoded={} cropped={} date={:?} in {:?}",
-        p.width, p.height, p.file_type, p.data.len() / 1024, p.reencoded, p.cropped, p.image_date, start.elapsed()
+        p.width,
+        p.height,
+        p.file_type,
+        p.data.len() / 1024,
+        p.reencoded,
+        p.cropped,
+        p.image_date,
+        start.elapsed()
     );
     Ok(())
 }

@@ -243,7 +243,7 @@ impl Hub {
     async fn with_art<T, F, Fut>(self: &Arc<Self>, tv: &Arc<Tv>, f: F) -> anyhow::Result<T>
     where
         F: Fn(Arc<ArtClient>) -> Fut,
-        Fut: std::future::Future<Output = samsung_frame::Result<T>>,
+        Fut: Future<Output = samsung_frame::Result<T>>,
     {
         let art = self.art(tv).await?;
         match f(art).await {
@@ -315,29 +315,28 @@ impl Hub {
             .collect();
         let existing = state.content_for_hash(&hash).filter(|id| on_tv.contains(*id)).map(str::to_owned);
         // Same photo, and either no explicit framing asked for or the same one as before.
-        let same = existing
-            .as_ref()
-            .filter(|id| framing.is_none() || state.uploads.get(*id).and_then(|r| r.framing.as_ref()) == framing.as_ref());
-        let (content_id, duplicate) = match same {
-            Some(id) => (id.clone(), true),
-            None => {
-                self.emit(json!({"type": "uploading", "tv": tv.name, "name": file_name}));
-                let mut settings = upload_settings(&cfg);
-                if let Some(f) = &framing {
-                    f.apply(&mut settings);
-                }
-                let result = self.upload_with_retry(tv, &path, &settings).await?;
-                state.record_framed(&result.content_id, &hash, &path, framing.clone());
-                // Re-sent with different framing: the new version replaces the old one.
-                if let Some(old) = existing {
-                    state.uploads.remove(&old);
-                    if let Err(e) = self.delete_from_tv(tv, vec![old]).await {
-                        tracing::warn!("removing the previous version from {}: {e:#}", tv.name);
-                    }
-                }
-                state.save(&state_file)?;
-                (result.content_id, false)
+        let same = existing.as_ref().filter(|id| {
+            framing.is_none() || state.uploads.get(*id).and_then(|r| r.framing.as_ref()) == framing.as_ref()
+        });
+        let (content_id, duplicate) = if let Some(id) = same {
+            (id.clone(), true)
+        } else {
+            self.emit(json!({"type": "uploading", "tv": tv.name, "name": file_name}));
+            let mut settings = upload_settings(&cfg);
+            if let Some(f) = &framing {
+                f.apply(&mut settings);
             }
+            let result = self.upload_with_retry(tv, &path, &settings).await?;
+            state.record_framed(&result.content_id, &hash, &path, framing.clone());
+            // Re-sent with different framing: the new version replaces the old one.
+            if let Some(old) = existing {
+                state.uploads.remove(&old);
+                if let Err(e) = self.delete_from_tv(tv, vec![old]).await {
+                    tracing::warn!("removing the previous version from {}: {e:#}", tv.name);
+                }
+            }
+            state.save(&state_file)?;
+            (result.content_id, false)
         };
         if show {
             let id = content_id.clone();
@@ -399,7 +398,7 @@ fn save_unique(dir: &Path, name: &str, data: &[u8], hash: &str) -> anyhow::Resul
 }
 
 pub async fn run(cfg: Config, cfg_path: PathBuf, state_dir: PathBuf, opts: ServeOptions) -> anyhow::Result<()> {
-    let data_dir = state_dir.parent().map(Path::to_path_buf).unwrap_or_else(|| state_dir.clone());
+    let data_dir = state_dir.parent().map_or_else(|| state_dir.clone(), Path::to_path_buf);
     let tvs = cfg.tvs.iter().cloned().map(Tv::new).collect::<Vec<_>>();
     let (events, _) = broadcast::channel(256);
     let hub = Arc::new(Hub {
@@ -487,7 +486,7 @@ pub async fn run(cfg: Config, cfg_path: PathBuf, state_dir: PathBuf, opts: Serve
             };
             #[cfg(not(unix))]
             let term = std::future::pending::<()>();
-            tokio::select! { _ = ctrl_c => {}, _ = term => {} }
+            tokio::select! { () = ctrl_c => {}, () = term => {} }
         })
         .await?;
     Ok(())
@@ -522,7 +521,8 @@ async fn start_localsend(hub: &Shared, pin: Option<String>) -> anyhow::Result<lo
             let show = hub.server_settings().show_on_receive;
             tracing::info!("received {} from {} via LocalSend", file.file_name, file.sender_alias);
             for tv in tvs {
-                let (hub, tv, file_name, data) = (Arc::clone(&hub), Arc::clone(tv), file.file_name.clone(), file.data.clone());
+                let (hub, tv, file_name, data) =
+                    (Arc::clone(&hub), Arc::clone(tv), file.file_name.clone(), file.data.clone());
                 let show = show && file.last_in_session;
                 let from = file.sender_alias.clone();
                 // TVs work in parallel; each TV's transfers are serialized by its own lock.
@@ -594,12 +594,20 @@ struct SettingsBody {
     show_on_receive: Option<bool>,
 }
 
-async fn put_settings(State(hub): State<Shared>, headers: HeaderMap, Json(b): Json<SettingsBody>) -> ApiResult<Json<Value>> {
+async fn put_settings(
+    State(hub): State<Shared>,
+    headers: HeaderMap,
+    Json(b): Json<SettingsBody>,
+) -> ApiResult<Json<Value>> {
     hub.require_admin(&headers)?;
     let public_url = match b.public_url.as_deref().map(str::trim) {
         Some("") => Some(None),
-        Some(u) if u.starts_with("http://") || u.starts_with("https://") => Some(Some(u.trim_end_matches('/').to_string())),
-        Some(u) => return Err(status_err(StatusCode::BAD_REQUEST, format!("`{u}` should start with http:// or https://"))),
+        Some(u) if u.starts_with("http://") || u.starts_with("https://") => {
+            Some(Some(u.trim_end_matches('/').to_string()))
+        }
+        Some(u) => {
+            return Err(status_err(StatusCode::BAD_REQUEST, format!("`{u}` should start with http:// or https://")));
+        }
         None => None,
     };
     if let Some(pin) = b.localsend_pin.as_deref().map(str::trim)
@@ -627,10 +635,10 @@ async fn put_settings(State(hub): State<Shared>, headers: HeaderMap, Json(b): Js
         }
     })?;
     let after = hub.server_settings();
-    if (before.localsend, &before.localsend_pin) != (after.localsend, &after.localsend_pin) {
-        hub.restart_localsend().await;
-    } else {
+    if (before.localsend, &before.localsend_pin) == (after.localsend, &after.localsend_pin) {
         hub.emit(json!({"type": "settings-changed"}));
+    } else {
+        hub.restart_localsend().await;
     }
     Ok(Json(settings_json(&hub)))
 }
@@ -667,7 +675,8 @@ struct QrQuery {
 
 async fn qr(Query(q): Query<QrQuery>) -> ApiResult<Response> {
     use qrcode::render::svg;
-    let code = qrcode::QrCode::new(q.text.as_bytes()).map_err(|e| status_err(StatusCode::BAD_REQUEST, format!("{e:?}")))?;
+    let code =
+        qrcode::QrCode::new(q.text.as_bytes()).map_err(|e| status_err(StatusCode::BAD_REQUEST, format!("{e:?}")))?;
     let svg = code
         .render::<svg::Color>()
         .min_dimensions(256, 256)
@@ -729,7 +738,7 @@ async fn add_tv(State(hub): State<Shared>, headers: HeaderMap, Json(b): Json<Add
     }
     let name = b.name.as_deref().map(str::trim).filter(|n| !n.is_empty());
     let cfg = hub.cfg.lock().unwrap().clone();
-    let port = cfg.find(host).map(|t| t.port).unwrap_or(samsung_frame::protocol::SECURE_PORT);
+    let port = cfg.find(host).map_or(samsung_frame::protocol::SECURE_PORT, |t| t.port);
     let paired = pairing::pair(&cfg, host, name, port, Duration::from_secs(60)).await?;
     let tv_cfg = paired.tv.clone();
     hub.save_config(|c| {
@@ -805,7 +814,11 @@ async fn update_tv(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn forget_tv(State(hub): State<Shared>, headers: HeaderMap, UrlPath(name): UrlPath<String>) -> ApiResult<StatusCode> {
+async fn forget_tv(
+    State(hub): State<Shared>,
+    headers: HeaderMap,
+    UrlPath(name): UrlPath<String>,
+) -> ApiResult<StatusCode> {
     hub.require_admin(&headers)?;
     let tv = hub.tv(&name)?;
     hub.tvs.write().unwrap().retain(|t| !Arc::ptr_eq(t, &tv));
@@ -842,7 +855,11 @@ struct PhotosQuery {
     category: Option<String>,
 }
 
-async fn photos(State(hub): State<Shared>, UrlPath(name): UrlPath<String>, Query(q): Query<PhotosQuery>) -> ApiResult<Json<Value>> {
+async fn photos(
+    State(hub): State<Shared>,
+    UrlPath(name): UrlPath<String>,
+    Query(q): Query<PhotosQuery>,
+) -> ApiResult<Json<Value>> {
     let tv = hub.tv(&name)?;
     let cat = match q.category.as_deref() {
         Some("favorites") => category::FAVORITES,
@@ -925,7 +942,8 @@ async fn thumb(State(hub): State<Shared>, UrlPath((name, id)): UrlPath<(String, 
     if find_thumb(&dir, &id).is_none() {
         fetch_thumbs(&hub, &tv, std::slice::from_ref(&id)).await?;
     }
-    let path = find_thumb(&dir, &id).ok_or_else(|| status_err(StatusCode::NOT_FOUND, format!("the TV sent no thumbnail for {id}")))?;
+    let path = find_thumb(&dir, &id)
+        .ok_or_else(|| status_err(StatusCode::NOT_FOUND, format!("the TV sent no thumbnail for {id}")))?;
     let mime = if path.extension().is_some_and(|e| e == "png") { "image/png" } else { "image/jpeg" };
     Ok((
         [(header::CONTENT_TYPE, mime), (header::CACHE_CONTROL, "private, max-age=86400")],
@@ -979,7 +997,11 @@ async fn upload(
     }
 }
 
-async fn show(State(hub): State<Shared>, headers: HeaderMap, UrlPath((name, id)): UrlPath<(String, String)>) -> ApiResult<StatusCode> {
+async fn show(
+    State(hub): State<Shared>,
+    headers: HeaderMap,
+    UrlPath((name, id)): UrlPath<(String, String)>,
+) -> ApiResult<StatusCode> {
     hub.require_admin(&headers)?;
     let tv = hub.tv(&name)?;
     hub.with_art(&tv, |a| {
@@ -1036,7 +1058,11 @@ async fn favorite(
 }
 
 /// The original photo behind one of our uploads, as a JPEG preview for the framing editor.
-async fn original(State(hub): State<Shared>, headers: HeaderMap, UrlPath((name, id)): UrlPath<(String, String)>) -> ApiResult<Response> {
+async fn original(
+    State(hub): State<Shared>,
+    headers: HeaderMap,
+    UrlPath((name, id)): UrlPath<(String, String)>,
+) -> ApiResult<Response> {
     hub.require_admin(&headers)?;
     let tv = hub.tv(&name)?;
     let state = TvState::load(&hub.state_file(&tv))?;
@@ -1044,9 +1070,9 @@ async fn original(State(hub): State<Shared>, headers: HeaderMap, UrlPath((name, 
         .uploads
         .get(&id)
         .ok_or_else(|| status_err(StatusCode::NOT_FOUND, "only photos sent from here can be reframed"))?;
-    let bytes = tokio::fs::read(&rec.source)
-        .await
-        .map_err(|e| status_err(StatusCode::NOT_FOUND, format!("the original ({}) is gone: {e}", rec.source.display())))?;
+    let bytes = tokio::fs::read(&rec.source).await.map_err(|e| {
+        status_err(StatusCode::NOT_FOUND, format!("the original ({}) is gone: {e}", rec.source.display()))
+    })?;
     let jpeg = tokio::task::spawn_blocking(move || image_prep::preview(&bytes, 2048)).await??;
     Ok(([(header::CONTENT_TYPE, "image/jpeg"), (header::CACHE_CONTROL, "private, max-age=3600")], jpeg).into_response())
 }
@@ -1071,10 +1097,8 @@ async fn reframe(
     if !rec.source.is_file() {
         return Err(status_err(StatusCode::NOT_FOUND, format!("the original ({}) is gone", rec.source.display())));
     }
-    let was_current = hub
-        .with_art(&tv, |a| async move { a.current_artwork().await })
-        .await
-        .is_ok_and(|c| c.content_id == id);
+    let was_current =
+        hub.with_art(&tv, |a| async move { a.current_artwork().await }).await.is_ok_and(|c| c.content_id == id);
     let mut settings = upload_settings(&tv.config());
     framing.apply(&mut settings);
     let result = hub.upload_with_retry(&tv, &rec.source, &settings).await?;
@@ -1132,7 +1156,12 @@ async fn mattes(State(hub): State<Shared>, UrlPath(name): UrlPath<String>) -> Ap
     Ok(Json(serde_json::to_value(m)?))
 }
 
-async fn artmode(State(hub): State<Shared>, headers: HeaderMap, UrlPath(name): UrlPath<String>, Json(b): Json<OnBody>) -> ApiResult<StatusCode> {
+async fn artmode(
+    State(hub): State<Shared>,
+    headers: HeaderMap,
+    UrlPath(name): UrlPath<String>,
+    Json(b): Json<OnBody>,
+) -> ApiResult<StatusCode> {
     hub.require_admin(&headers)?;
     let tv = hub.tv(&name)?;
     hub.with_art(&tv, |a| async move { a.set_artmode(b.on).await }).await?;
@@ -1180,8 +1209,11 @@ async fn sync_folder(
 ) -> ApiResult<StatusCode> {
     hub.require_admin(&headers)?;
     let tv = hub.tv(&name)?;
-    let delete = body.map(|Json(b)| b.delete).unwrap_or(false);
-    let folder = tv.config().folder.ok_or_else(|| status_err(StatusCode::BAD_REQUEST, format!("no folder configured for {name}")))?;
+    let delete = body.is_some_and(|Json(b)| b.delete);
+    let folder = tv
+        .config()
+        .folder
+        .ok_or_else(|| status_err(StatusCode::BAD_REQUEST, format!("no folder configured for {name}")))?;
     let hub2 = Arc::clone(&hub);
     tokio::spawn(async move {
         let result: anyhow::Result<()> = async {
@@ -1194,7 +1226,9 @@ async fn sync_folder(
             let state_file = hub2.state_file(&tv);
             let mut state = TvState::load(&state_file)?;
             let plan = sync::plan(&local, &state, &on_tv, delete);
-            hub2.emit(json!({"type": "sync-start", "tv": tv.name, "upload": plan.upload.len(), "delete": plan.delete.len()}));
+            hub2.emit(
+                json!({"type": "sync-start", "tv": tv.name, "upload": plan.upload.len(), "delete": plan.delete.len()}),
+            );
             let settings = upload_settings(&tv.config());
             let name = tv.name.clone();
             let outcome = sync::execute(&art, &mut state, &state_file, plan, &settings, |ev| match ev {
@@ -1289,7 +1323,13 @@ fn render_share_card(text: &str, w: u32, h: u32) -> anyhow::Result<Vec<u8>> {
         }
     };
     let border = module * 2;
-    fill(x0.saturating_sub(border), y0.saturating_sub(border), side + 2 * border, side + 2 * border, Rgb([201, 169, 110]));
+    fill(
+        x0.saturating_sub(border),
+        y0.saturating_sub(border),
+        side + 2 * border,
+        side + 2 * border,
+        Rgb([201, 169, 110]),
+    );
     fill(x0, y0, side, side, Rgb([255, 255, 255]));
     for (i, c) in code.to_colors().iter().enumerate() {
         if *c == qrcode::Color::Dark {
@@ -1335,7 +1375,7 @@ mod tests {
             show: None,
             fit: Some("cover".into()),
             crop: Some("0.1,0,0.8,1".into()),
-            matte: Some("".into()),
+            matte: Some(String::new()),
         };
         let f = q.framing().ok().flatten().unwrap();
         assert_eq!(f.fit, image_prep::Fit::Cover);

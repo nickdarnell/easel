@@ -66,7 +66,7 @@ pub async fn pair(cfg: &Config, host: &str, name: Option<&str>, port: u16, timeo
     }
     art.close().await;
 
-    Ok(Paired { tv, api_version, photo_count, is_frame: info.as_ref().is_none_or(|i| i.is_frame()) })
+    Ok(Paired { tv, api_version, photo_count, is_frame: info.as_ref().is_none_or(rest::DeviceInfo::is_frame) })
 }
 
 #[cfg(test)]

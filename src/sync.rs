@@ -94,10 +94,8 @@ impl TvState {
 
 /// State file for a TV, named after it.
 pub fn state_path(state_dir: &Path, tv_name: &str) -> PathBuf {
-    let safe: String = tv_name
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
-        .collect();
+    let safe: String =
+        tv_name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
     state_dir.join(format!("{safe}.json"))
 }
 
@@ -130,9 +128,9 @@ pub fn scan_folder(dir: &Path) -> Result<Vec<LocalImage>> {
         .follow_links(true)
         .into_iter()
         .filter_entry(|e| e.depth() == 0 || !e.file_name().to_string_lossy().starts_with('.'))
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .filter(|e| e.file_type().is_file() && image_prep::is_supported_path(e.path()))
-        .map(|e| e.into_path())
+        .map(walkdir::DirEntry::into_path)
         .collect();
     paths.sort();
     let mut seen = HashSet::new();
@@ -335,7 +333,7 @@ mod tests {
         let local = vec![img("a.jpg", "A"), img("b.jpg", "B"), img("c.jpg", "C")];
         // A is on the TV; D was ours but removed locally; E was deleted on the TV itself.
         let st = state(&[("MY_F1", "A"), ("MY_F2", "D"), ("MY_F3", "E")]);
-        let on_tv: HashSet<String> = ["MY_F1", "MY_F2", "MY_F9"].iter().map(|s| s.to_string()).collect();
+        let on_tv: HashSet<String> = ["MY_F1", "MY_F2", "MY_F9"].iter().map(ToString::to_string).collect();
 
         let p = plan(&local, &st, &on_tv, true);
         let up: Vec<_> = p.upload.iter().map(|l| l.hash.as_str()).collect();
@@ -346,7 +344,7 @@ mod tests {
 
         // MY_F9 (not ours) is never deleted, and nothing is deleted without the flag.
         let p = plan(&local, &st, &on_tv, false);
-        assert!(p.delete.is_empty());
+        assert_eq!(p.delete, [] as [(String, PathBuf); 0]);
     }
 
     #[test]

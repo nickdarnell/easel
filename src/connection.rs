@@ -50,13 +50,11 @@ where
             }
             Message::Binary(bytes) => {
                 tracing::trace!(target: "samsung_frame::wire", "<- binary frame, {} bytes", bytes.len());
-                match protocol::split_json_and_binary(&bytes) {
-                    Some((json, tail)) => {
-                        let binary = (!tail.is_empty()).then_some(tail);
-                        return Ok(Some(Incoming { json, binary }));
-                    }
-                    None => tracing::debug!("ignoring binary frame without JSON header"),
+                if let Some((json, tail)) = protocol::split_json_and_binary(&bytes) {
+                    let binary = (!tail.is_empty()).then_some(tail);
+                    return Ok(Some(Incoming { json, binary }));
                 }
+                tracing::debug!("ignoring binary frame without JSON header");
             }
             Message::Close(_) => return Ok(None),
             // Pings are answered by tungstenite automatically.

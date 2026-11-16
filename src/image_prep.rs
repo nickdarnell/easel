@@ -144,10 +144,8 @@ fn read_exif(bytes: &[u8]) -> ExifBits {
     let Ok(exif) = exif::Reader::new().read_from_container(&mut Cursor::new(bytes)) else {
         return ExifBits { orientation: 1, ..Default::default() };
     };
-    let orientation = exif
-        .get_field(exif::Tag::Orientation, exif::In::PRIMARY)
-        .and_then(|f| f.value.get_uint(0))
-        .unwrap_or(1);
+    let orientation =
+        exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY).and_then(|f| f.value.get_uint(0)).unwrap_or(1);
     let date = [exif::Tag::DateTimeOriginal, exif::Tag::DateTime].iter().find_map(|tag| {
         let field = exif.get_field(*tag, exif::In::PRIMARY)?;
         match &field.value {
@@ -165,7 +163,9 @@ fn read_exif(bytes: &[u8]) -> ExifBits {
 }
 
 fn is_heif(bytes: &[u8]) -> bool {
-    bytes.len() > 12 && &bytes[4..8] == b"ftyp" && matches!(&bytes[8..12], b"heic" | b"heix" | b"mif1" | b"msf1" | b"heif" | b"avif")
+    bytes.len() > 12
+        && &bytes[4..8] == b"ftyp"
+        && matches!(&bytes[8..12], b"heic" | b"heix" | b"mif1" | b"msf1" | b"heif" | b"avif")
 }
 
 /// The largest box with the panel's aspect ratio that fits inside `w`x`h`, capped at the
@@ -248,7 +248,7 @@ pub fn prepare(bytes: &[u8], opts: &PrepOptions) -> Result<Prepared> {
         (None, None) => unreachable!("either decoded or a known format"),
     };
     let crop = opts.crop.and_then(|c| c.to_pixels(full_w, full_h));
-    let (w, h) = crop.map(|(_, _, cw, ch)| (cw, ch)).unwrap_or((full_w, full_h));
+    let (w, h) = crop.map_or((full_w, full_h), |(_, _, cw, ch)| (cw, ch));
     let (pw, ph) = (opts.width, opts.height);
 
     let fit = match opts.fit {
@@ -299,8 +299,12 @@ pub fn prepare(bytes: &[u8], opts: &PrepOptions) -> Result<Prepared> {
     };
     let cropped = crop.is_some() || (fit == Fit::Cover && (w as u64 * target.1 as u64 != h as u64 * target.0 as u64));
     let img = match fit {
-        Fit::Cover if (img.width(), img.height()) != target => img.resize_to_fill(target.0, target.1, FilterType::Lanczos3),
-        Fit::Contain if (img.width(), img.height()) != target => img.resize_exact(target.0, target.1, FilterType::Lanczos3),
+        Fit::Cover if (img.width(), img.height()) != target => {
+            img.resize_to_fill(target.0, target.1, FilterType::Lanczos3)
+        }
+        Fit::Contain if (img.width(), img.height()) != target => {
+            img.resize_exact(target.0, target.1, FilterType::Lanczos3)
+        }
         _ => img,
     };
     Ok(Prepared {
@@ -347,7 +351,10 @@ pub fn heif_supported() -> bool {
 pub fn is_supported_or_heif_path(path: &Path) -> bool {
     is_supported_path(path)
         || (heif_supported()
-            && path.extension().and_then(|e| e.to_str()).is_some_and(|e| HEIF_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str())))
+            && path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| HEIF_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str())))
 }
 
 pub fn is_supported_path(path: &Path) -> bool {
@@ -361,8 +368,11 @@ mod heif {
     //! HEIF decoding through Windows Imaging Component (needs the HEIF Image Extensions and
     //! HEVC Video Extensions from the Microsoft Store, preinstalled on most Windows 11 PCs).
     use image::{DynamicImage, RgbaImage};
-    use windows::Win32::Graphics::Imaging::*;
-    use windows::Win32::System::Com::*;
+    use windows::Win32::Graphics::Imaging::{
+        CLSID_WICImagingFactory, GUID_WICPixelFormat32bppRGBA, IWICImagingFactory, WICBitmapDitherTypeNone,
+        WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnDemand,
+    };
+    use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx};
 
     use crate::{Error, Result};
 
@@ -386,12 +396,20 @@ mod heif {
             let decoder = factory.CreateDecoderFromStream(&stream, std::ptr::null(), WICDecodeMetadataCacheOnDemand)?;
             let frame = decoder.GetFrame(0)?;
             let converter = factory.CreateFormatConverter()?;
-            converter.Initialize(&frame, &GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeCustom)?;
+            converter.Initialize(
+                &frame,
+                &GUID_WICPixelFormat32bppRGBA,
+                WICBitmapDitherTypeNone,
+                None,
+                0.0,
+                WICBitmapPaletteTypeCustom,
+            )?;
             let (mut w, mut h) = (0u32, 0u32);
-            converter.GetSize(&mut w, &mut h)?;
+            converter.GetSize(&raw mut w, &raw mut h)?;
             let mut buf = vec![0u8; w as usize * h as usize * 4];
             converter.CopyPixels(std::ptr::null(), w * 4, &mut buf)?;
-            let img = RgbaImage::from_raw(w, h, buf).ok_or_else(|| windows::core::Error::from_hresult(windows::core::HRESULT(-1)))?;
+            let img = RgbaImage::from_raw(w, h, buf)
+                .ok_or_else(|| windows::core::Error::from_hresult(windows::core::HRESULT(-1)))?;
             Ok(DynamicImage::ImageRgba8(img))
         }
     }

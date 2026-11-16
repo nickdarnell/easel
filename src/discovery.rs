@@ -11,10 +11,8 @@ use crate::rest::{self, DeviceInfo};
 use crate::{Result, protocol};
 
 const SSDP_ADDR: &str = "239.255.255.250:1900";
-const SEARCH_TARGETS: &[&str] = &[
-    "urn:samsung.com:device:RemoteControlReceiver:1",
-    "urn:dial-multiscreen-org:service:dial:1",
-];
+const SEARCH_TARGETS: &[&str] =
+    &["urn:samsung.com:device:RemoteControlReceiver:1", "urn:dial-multiscreen-org:service:dial:1"];
 
 #[derive(Debug, Clone)]
 pub struct Discovered {
@@ -27,9 +25,8 @@ pub async fn ssdp(wait: Duration) -> Result<Vec<Discovered>> {
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
     socket.set_multicast_ttl_v4(2).ok();
     for st in SEARCH_TARGETS {
-        let msg = format!(
-            "M-SEARCH * HTTP/1.1\r\nHOST: {SSDP_ADDR}\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\nST: {st}\r\n\r\n"
-        );
+        let msg =
+            format!("M-SEARCH * HTTP/1.1\r\nHOST: {SSDP_ADDR}\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\nST: {st}\r\n\r\n");
         // Send twice; UDP multicast is lossy on Wi-Fi.
         for _ in 0..2 {
             socket.send_to(msg.as_bytes(), SSDP_ADDR).await?;
