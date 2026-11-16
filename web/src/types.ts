@@ -1,6 +1,8 @@
 // The server's API types are generated from the Rust code (src/bin/frametv/api.rs) into ./api
 // by `cargo test`; don't edit those by hand. This re-exports them, plus a few UI-only types.
 
+export type * from "./api/Activity";
+export type * from "./api/ActivityKind";
 export type * from "./api/AddTv";
 export type * from "./api/Crop";
 export type * from "./api/Current";

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // The selected TV: what it's showing, sending photos, and its controls.
-import { computed, reactive, watch } from "vue";
+import { computed, onUnmounted, reactive, ref, watch } from "vue";
 import type { Tv } from "../types";
 import { pick } from "../composer";
 import {
@@ -16,24 +16,46 @@ import {
   slideshow,
   thumbUrl,
   toggleArt,
+  tvReady,
   wake,
 } from "../state";
 import { store } from "../util";
 
 const props = defineProps<{ tv: Tv }>();
 
-const on = computed(() => props.tv.power === "on");
+// What the server is doing to get the TV to answer; anything sent meanwhile waits for it.
+const activity = computed(() => S.status?.activity ?? null);
+const on = tvReady;
+const now = ref(Date.now());
+let tick: ReturnType<typeof setInterval> | undefined;
+watch(
+  () => !!activity.value,
+  (busy) => {
+    clearInterval(tick);
+    if (busy) tick = setInterval(() => (now.value = Date.now()), 1000);
+  },
+  { immediate: true },
+);
+onUnmounted(() => clearInterval(tick));
+const elapsed = computed(() => {
+  const a = activity.value;
+  if (!a) return "";
+  const s = Math.max(0, Math.round((now.value - a.since) / 1000));
+  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
+});
 const current = computed(() => S.status?.current?.content_id);
 const sharing = computed(() => !!S.status?.sharing || !!pending.share);
 const artmode = computed(() => pending.art ?? S.status?.artmode);
 const state = computed(() =>
-  on.value
-    ? artmode.value === false
-      ? "On, watching TV"
-      : "Showing art"
-    : props.tv.power === "standby"
-      ? "Standby"
-      : "Off",
+  activity.value && activity.value.kind !== "waiting"
+    ? "Not answering yet"
+    : on.value
+      ? artmode.value === false
+        ? "On, watching TV"
+        : "Showing art"
+      : props.tv.power === "standby"
+        ? "Standby"
+        : "Off",
 );
 const identity = computed(() =>
   [props.tv.size_inches ? `${props.tv.size_inches}″` : null, props.tv.model].filter(Boolean).join(" · "),
@@ -124,7 +146,12 @@ const stop = () => setSlideshow({ ...slideshow.value, minutes: 0 });
         <span v-if="identity">{{ identity }}</span>
         <span>{{ S.photos?.length ?? "…" }} photos</span>
       </div>
-      <div v-if="S.statusErr && on" class="notice err">{{ S.statusErr }}</div>
+      <div v-if="activity" class="notice row activity">
+        <span class="spinner sm"></span>
+        <span class="grow">{{ activity.message }}</span>
+        <span class="muted small">{{ elapsed }}</span>
+      </div>
+      <div v-else-if="S.statusErr && on" class="notice err">{{ S.statusErr }}</div>
 
       <div v-if="isAdmin && on && sharing" class="notice banner">
         <div class="grow">

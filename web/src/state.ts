@@ -67,6 +67,13 @@ export interface SlideshowChoice {
 }
 
 export const curTv = computed(() => S.tvs.find((t) => t.name === S.tv));
+/** Whether the selected TV takes requests now, or the server is getting it to (requests wait
+ * for that rather than fail). Some TVs say they're in standby while showing art. */
+export const tvReady = computed(() => {
+  const tv = curTv.value;
+  if (!tv) return false;
+  return tv.power === "on" || !!S.status?.activity || (tv.power === "standby" && S.status?.artmode === true);
+});
 /** Admin controls are shown to admins, but never on the guest page. */
 export const isAdmin = computed(() => !!S.info?.admin && !S.guestTv);
 
@@ -181,8 +188,8 @@ watch(
 export async function loadTv() {
   const tv = curTv.value;
   if (!tv) return;
-  // The server keeps the last photo list each TV sent, so photos show even while it's off.
-  if (tv.power !== "on") return loadPhotos();
+  // The server answers both from what it last heard (so photos show even while the TV is off),
+  // and asks the TV in the background, waking it if need be.
   await Promise.all([loadStatus(), loadPhotos()]);
 }
 

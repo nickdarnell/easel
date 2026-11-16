@@ -113,6 +113,36 @@ pub struct Status {
     pub slideshow: Option<Slideshow>,
     /// A QR code card is up on the TV (see `POST .../share-card`).
     pub sharing: bool,
+    /// What the server is doing to get the TV to answer, while it's at it. Requests for the TV
+    /// wait meanwhile rather than fail.
+    pub activity: Option<Activity>,
+}
+
+#[derive(Clone, PartialEq, Serialize, TS)]
+#[ts(export)]
+pub struct Activity {
+    pub kind: ActivityKind,
+    /// Says what's happening, for showing as is.
+    pub message: String,
+    /// When it started (ms since the epoch).
+    #[ts(type = "number")]
+    pub since: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export)]
+pub enum ActivityKind {
+    /// The TV is slow to answer a request.
+    Waiting,
+    /// It stopped answering: connecting again.
+    Reconnecting,
+    /// Sending Wake-on-LAN.
+    Waking,
+    /// Its art app is stuck: turning the TV off and on again.
+    Restarting,
+    /// Nothing worked yet; trying again shortly.
+    Retrying,
 }
 
 #[derive(Clone, PartialEq, Serialize, TS)]

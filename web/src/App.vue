@@ -24,6 +24,7 @@ import {
   openAppSettings,
   openDialog,
   selectTv,
+  tvReady,
 } from "./state";
 import { errorMessage, store } from "./util";
 
@@ -61,7 +62,7 @@ watchEffect(() => {
 // ── drag & drop anywhere, and pasting images ─────────────────────────
 const dragDepth = ref(0);
 const hasFiles = (e: DragEvent) => [...(e.dataTransfer?.types || [])].includes("Files");
-const canReceive = () => !!S.tv && curTv.value?.power === "on" && (!dialog.value || composing());
+const canReceive = () => !!S.tv && tvReady.value && (!dialog.value || composing());
 const targets = () => composer.value?.tvs || [S.tv!];
 
 addEventListener("dragenter", (e) => {

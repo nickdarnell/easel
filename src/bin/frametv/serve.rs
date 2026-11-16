@@ -63,6 +63,25 @@ const RETRY_CONNECT_AFTER: Duration = Duration::from_secs(10);
 const RETRY_THUMB_AFTER: Duration = Duration::from_secs(10 * 60);
 /// A QR code card left on the TV is taken down after this long.
 const SHARE_CARD_FOR: Duration = Duration::from_secs(30 * 60);
+/// A request the TV takes longer than this to answer shows as "waiting for the TV" on its page.
+const SLOW_REPLY: Duration = Duration::from_secs(5);
+/// How long connecting to the TV may take.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// While getting a TV to answer, how long its art app gets to answer a test request.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long Wake-on-LAN gets to work.
+const WAKE_FOR: Duration = Duration::from_secs(60);
+/// After a restart, how long the TV gets to come back.
+const RESTART_WAKE_FOR: Duration = Duration::from_secs(120);
+/// The server turns a stuck TV off and on again at most this often.
+const RESTART_AT_MOST_EVERY: Duration = Duration::from_secs(15 * 60);
+/// After failing to get a TV to answer, the wait before trying again.
+const RECOVERY_PAUSE: Duration = Duration::from_secs(20);
+/// Rounds of getting the TV to answer that a request sits through before giving up.
+const RECOVERY_ROUNDS: u32 = 3;
+/// Some TVs say they're in standby while showing art: if the art app answered this recently,
+/// the TV counts as on.
+const ANSWERED_RECENTLY: Duration = Duration::from_secs(90);
 
 pub struct ServeOptions {
     pub bind: IpAddr,
@@ -96,6 +115,27 @@ struct Tv {
     viewers: AtomicUsize,
     /// Whether the loop that keeps an eye on it while it has viewers is running.
     watching: AtomicBool,
+    /// What the server is doing to get the TV to answer (shown on its page).
+    activity: StdMutex<Option<api::Activity>>,
+    /// Getting the TV to answer, if that's under way: every request waits for the same one.
+    recovery: StdMutex<Option<Recovery>>,
+    /// When the server last turned the TV off and on again to unstick it.
+    last_restart: StdMutex<Option<Instant>>,
+    /// When the art app last answered.
+    answered: StdMutex<Option<Instant>>,
+}
+
+/// A shared, detached attempt at getting a TV to answer (see [`Hub::recover`]).
+type Recovery = futures_util::future::Shared<futures_util::future::BoxFuture<'static, Recovered>>;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Recovered {
+    /// It answered straight away on a new connection: the TV is fine.
+    Fine,
+    /// It answers again, after being woken or restarted.
+    Fixed,
+    /// It still doesn't answer.
+    No,
 }
 
 impl Tv {
@@ -115,6 +155,10 @@ impl Tv {
             power: StdMutex::new(None),
             viewers: AtomicUsize::new(0),
             watching: AtomicBool::new(false),
+            activity: StdMutex::new(None),
+            recovery: StdMutex::new(None),
+            last_restart: StdMutex::new(None),
+            answered: StdMutex::new(None),
         })
     }
 
@@ -147,9 +191,16 @@ impl Tv {
         self.viewers.load(Ordering::SeqCst) > 0
     }
 
-    /// Whether it was on when last checked (or hasn't been checked yet).
+    /// Whether it answered when last checked (or hasn't been checked yet). Standby counts: some
+    /// TVs say that while showing art.
     fn maybe_on(&self) -> bool {
-        self.power.lock().unwrap().as_ref().is_none_or(|(p, _)| *p == api::Power::On)
+        self.power.lock().unwrap().as_ref().is_none_or(|(p, _)| *p != api::Power::Off)
+    }
+
+    /// Whether the server is getting the TV to answer right now.
+    fn recovering(&self) -> bool {
+        self.recovery.lock().unwrap().is_some()
+            || self.activity.lock().unwrap().as_ref().is_some_and(|a| a.kind != api::ActivityKind::Waiting)
     }
 
     /// How long ago the TV last said what it's showing.
@@ -303,6 +354,14 @@ fn is_disconnect(e: &samsung_frame::Error) -> bool {
     matches!(e, samsung_frame::Error::Disconnected | samsung_frame::Error::WebSocket(_))
 }
 
+/// Whether the TV says it's on, over plain HTTP.
+async fn rest_power(host: &str) -> api::Power {
+    match rest::device_info(host, Duration::from_secs(2)).await {
+        Ok(i) => api::Power::from_tv(i.power_state()),
+        Err(_) => api::Power::Off,
+    }
+}
+
 /// A connection that stops answering (the TV dozed off, Wi-Fi dropped) often still looks open.
 fn is_unanswered(e: &samsung_frame::Error) -> bool {
     is_disconnect(e) || matches!(e, samsung_frame::Error::Timeout(..))
@@ -429,35 +488,15 @@ impl Hub {
         Ok(true)
     }
 
-    /// The art connection, reconnecting if the TV dropped it.
-    async fn art(self: &Arc<Self>, tv: &Arc<Tv>) -> anyhow::Result<Arc<ArtClient>> {
-        let mut slot = tv.art.lock().await;
-        if let Some(a) = slot.as_ref()
-            && a.is_connected()
-        {
-            return Ok(Arc::clone(a));
-        }
-        // It just failed: don't make every request wait for it again.
-        if let Some(why) = tv.down_reason() {
-            return Err(anyhow!(why));
-        }
+    /// Connect to the TV's art app (saving the token if the TV issued a new one).
+    async fn open_art(self: &Arc<Self>, tv: &Arc<Tv>) -> anyhow::Result<ArtClient> {
         let cfg = tv.config();
         let client_name = self.cfg.lock().unwrap().client_name.clone();
         let endpoint = cfg.endpoint(&client_name);
-        let connected = match tokio::time::timeout(Duration::from_secs(15), ArtClient::connect(&endpoint)).await {
-            Ok(Ok(art)) => Ok(art),
-            Ok(Err(e)) => Err(anyhow::Error::new(e).context(format!("connecting to {}", tv.name))),
-            Err(_) => Err(anyhow!("{} did not answer (is it on?)", tv.name)),
-        };
-        let art = match connected {
-            Ok(art) => {
-                tv.down.lock().unwrap().take();
-                art
-            }
-            Err(e) => {
-                *tv.down.lock().unwrap() = Some((Instant::now(), format!("{e:#}")));
-                return Err(e);
-            }
+        let art = match tokio::time::timeout(CONNECT_TIMEOUT, ArtClient::connect(&endpoint)).await {
+            Ok(Ok(art)) => art,
+            Ok(Err(e)) => return Err(anyhow::Error::new(e).context(format!("connecting to {}", tv.name))),
+            Err(_) => return Err(anyhow!("{} did not answer (is it on?)", tv.name)),
         };
         if let Some(token) = art.issued_token()
             && cfg.token.as_deref() != Some(token)
@@ -471,12 +510,17 @@ impl Hub {
                 }
             })?;
         }
+        Ok(art)
+    }
+
+    /// Start using a new art connection: follow the TV's own news on it.
+    fn adopt(self: &Arc<Self>, art: ArtClient, name: &str) -> Arc<ArtClient> {
         let art = Arc::new(art);
         // The TV's own news (selection changes, art mode, slideshow, photos changed by anyone,
         // including the phone app): update what the server knows, and pass it on to the pages.
         // Answers to the server's own requests are left out.
         let mut rx = art.subscribe();
-        let (hub, name) = (Arc::clone(self), tv.name.clone());
+        let (hub, name) = (Arc::clone(self), name.to_string());
         tokio::spawn(async move {
             loop {
                 match rx.recv().await {
@@ -496,28 +540,300 @@ impl Hub {
                 }
             }
         });
-        *slot = Some(Arc::clone(&art));
-        Ok(art)
+        art
     }
 
-    /// Run `f` against the TV (whoever calls this holds a turn), retrying once on a fresh
-    /// connection if the old one had died, or, with `retry_unanswered`, if the TV didn't answer
-    /// at all (only safe for requests that change nothing).
-    async fn call<T, F, Fut>(self: &Arc<Self>, tv: &Arc<Tv>, retry_unanswered: bool, f: F) -> anyhow::Result<T>
+    /// The art connection, reconnecting if the TV dropped it.
+    async fn art(self: &Arc<Self>, tv: &Arc<Tv>) -> anyhow::Result<Arc<ArtClient>> {
+        let mut slot = tv.art.lock().await;
+        if let Some(a) = slot.as_ref()
+            && a.is_connected()
+        {
+            return Ok(Arc::clone(a));
+        }
+        // It just failed: don't make every request wait for it again.
+        if let Some(why) = tv.down_reason() {
+            return Err(anyhow!(why));
+        }
+        match self.open_art(tv).await {
+            Ok(art) => {
+                tv.down.lock().unwrap().take();
+                let art = self.adopt(art, &tv.name);
+                *slot = Some(Arc::clone(&art));
+                Ok(art)
+            }
+            Err(e) => {
+                *tv.down.lock().unwrap() = Some((Instant::now(), format!("{e:#}")));
+                Err(e)
+            }
+        }
+    }
+
+    /// Say what the server is doing to get the TV to answer (`None`: nothing), and tell the
+    /// pages. The start time carries over while it keeps at it, so pages can show how long.
+    fn set_activity(&self, tv: &Tv, activity: Option<(api::ActivityKind, String)>) {
+        let changed = {
+            let mut slot = tv.activity.lock().unwrap();
+            let since = slot.as_ref().map_or_else(cache::now_ms, |a| a.since);
+            let next = activity.map(|(kind, message)| api::Activity { kind, message, since });
+            let changed = *slot != next;
+            *slot = next;
+            changed
+        };
+        if changed {
+            self.emit(ServerEvent::Status { tv: tv.name.clone(), status: self.status(tv) });
+        }
+    }
+
+    /// The art app answered: the TV is on, whatever it says over REST.
+    fn answered(&self, tv: &Tv) {
+        *tv.answered.lock().unwrap() = Some(Instant::now());
+        let was = tv.power.lock().unwrap().replace((api::Power::On, Instant::now())).map(|(p, _)| p);
+        if was.is_some_and(|p| p != api::Power::On) {
+            self.emit(ServerEvent::TvsChanged);
+        }
+    }
+
+    /// Run `f` against the TV (whoever calls this holds a turn at `prio`).
+    ///
+    /// Requests wait rather than fail when the TV is slow or stuck: a dropped connection is
+    /// replaced, and if the TV doesn't answer, the server gets it to (see [`Self::recover`])
+    /// and asks again. Background upkeep doesn't wait for that, nor does a read whose page has
+    /// been closed; anything else gives up after [`RECOVERY_ROUNDS`] failed attempts.
+    async fn call<T, F, Fut>(self: &Arc<Self>, tv: &Arc<Tv>, prio: Prio, f: F) -> anyhow::Result<T>
     where
         F: Fn(Arc<ArtClient>) -> Fut,
         Fut: Future<Output = samsung_frame::Result<T>>,
     {
-        let art = self.art(tv).await?;
-        match f(art).await {
-            Err(e) if is_disconnect(&e) || (retry_unanswered && is_unanswered(&e)) => {
-                tracing::info!("{}: {e}; retrying on a new connection", tv.name);
-                tv.art.lock().await.take();
-                let art = self.art(tv).await?;
-                Ok(f(art).await?)
+        let (mut rounds, mut reconnected, mut was_fine) = (0, false, false);
+        loop {
+            let pending = tv.recovery.lock().unwrap().clone();
+            if let Some(recovery) = pending {
+                if prio == Prio::Background {
+                    return Err(anyhow!("{} isn't answering yet", tv.name));
+                }
+                recovery.await;
             }
-            other => Ok(other?),
+            let failure = match self.art(tv).await {
+                Ok(art) => match self.timed(tv, prio, f(art)).await {
+                    Ok(v) => {
+                        self.answered(tv);
+                        return Ok(v);
+                    }
+                    Err(e) if is_disconnect(&e) && !reconnected => {
+                        tracing::info!("{}: {e}; retrying on a new connection", tv.name);
+                        reconnected = true;
+                        tv.art.lock().await.take();
+                        continue;
+                    }
+                    Err(e) if is_unanswered(&e) => anyhow::Error::new(e),
+                    Err(e) => return Err(e.into()),
+                },
+                Err(e) => e,
+            };
+            let give_up = match prio {
+                Prio::Background => true,
+                Prio::Read => !tv.watched() || rounds >= RECOVERY_ROUNDS,
+                Prio::Command => rounds >= RECOVERY_ROUNDS,
+            };
+            if give_up {
+                return Err(failure);
+            }
+            tracing::info!("{}: {failure:#}; getting it to answer", tv.name);
+            tv.art.lock().await.take();
+            reconnected = false;
+            match self.recover(tv, prio == Prio::Command).await {
+                // It answers other requests, so it's this one it can't: asking again once is
+                // all that's worth doing.
+                Recovered::Fine if was_fine => return Err(failure),
+                Recovered::Fine => was_fine = true,
+                Recovered::Fixed | Recovered::No => rounds += 1,
+            }
         }
+    }
+
+    /// Wait for `fut`, telling the page when the TV is slow to answer (unless it's only upkeep).
+    async fn timed<T>(
+        &self,
+        tv: &Tv,
+        prio: Prio,
+        fut: impl Future<Output = samsung_frame::Result<T>>,
+    ) -> samsung_frame::Result<T> {
+        /// Takes the "waiting" note down again, however the wait ends.
+        struct Shown<'a>(&'a Hub, &'a Tv);
+        impl Drop for Shown<'_> {
+            fn drop(&mut self) {
+                let activity = self.1.activity.lock().unwrap().as_ref().map(|a| a.kind);
+                if activity == Some(api::ActivityKind::Waiting) {
+                    self.0.set_activity(self.1, None);
+                }
+            }
+        }
+        if prio == Prio::Background {
+            return fut.await;
+        }
+        tokio::pin!(fut);
+        tokio::select! {
+            r = &mut fut => return r,
+            () = tokio::time::sleep(SLOW_REPLY) => {}
+        }
+        let mut shown = None;
+        if tv.activity.lock().unwrap().is_none() {
+            self.set_activity(tv, Some((api::ActivityKind::Waiting, format!("Waiting for {} to answer…", tv.name))));
+            shown = Some(Shown(self, tv));
+        }
+        let r = fut.await;
+        drop(shown);
+        r
+    }
+
+    /// Get the TV to answer: reconnect, wake it, and as a last resort turn it off and on again
+    /// (its art app sometimes stops answering until then). Everyone who needs the TV meanwhile
+    /// waits for the same attempt, which carries on even if they stop waiting. A TV that says
+    /// it's on (someone may be watching) is only restarted for a command.
+    async fn recover(self: &Arc<Self>, tv: &Arc<Tv>, may_restart: bool) -> Recovered {
+        let recovery = {
+            let mut slot = tv.recovery.lock().unwrap();
+            if let Some(r) = slot.as_ref() {
+                r.clone()
+            } else {
+                let (hub, t) = (Arc::clone(self), Arc::clone(tv));
+                // The slot stays locked until it's filled, so the task can't clear it first.
+                let task = tokio::spawn(async move {
+                    let outcome = hub.run_recovery(&t, may_restart).await;
+                    t.recovery.lock().unwrap().take();
+                    outcome
+                });
+                let fut: futures_util::future::BoxFuture<'static, Recovered> =
+                    Box::pin(async move { task.await.unwrap_or(Recovered::No) });
+                let r = futures_util::FutureExt::shared(fut);
+                *slot = Some(r.clone());
+                r
+            }
+        };
+        recovery.await
+    }
+
+    async fn run_recovery(self: &Arc<Self>, tv: &Arc<Tv>, may_restart: bool) -> Recovered {
+        use api::ActivityKind::{Reconnecting, Restarting, Retrying, Waking};
+        let name = tv.name.clone();
+        let cfg = tv.config();
+        let outcome = 'done: {
+            self.set_activity(tv, Some((Reconnecting, format!("{name} isn't answering. Reconnecting…"))));
+            if self.probe(tv).await {
+                break 'done Recovered::Fine;
+            }
+            let power = rest_power(&cfg.host).await;
+            if let Some(mac) = &cfg.mac
+                && power != api::Power::On
+            {
+                self.set_activity(tv, Some((Waking, format!("Waking {name}…"))));
+                if self.wake_and_probe(tv, mac, WAKE_FOR).await {
+                    break 'done Recovered::Fixed;
+                }
+            }
+            let restarted_lately =
+                tv.last_restart.lock().unwrap().is_some_and(|at| at.elapsed() < RESTART_AT_MOST_EVERY);
+            if let Some(mac) = &cfg.mac
+                && !restarted_lately
+                && (may_restart || power != api::Power::On)
+            {
+                *tv.last_restart.lock().unwrap() = Some(Instant::now());
+                let msg = format!("{name} is stuck. Restarting it (about a minute)…");
+                self.set_activity(tv, Some((Restarting, msg)));
+                tracing::warn!("{name}: its art app isn't answering; turning it off and on again");
+                self.power_cycle(tv).await;
+                self.set_activity(tv, Some((Waking, format!("Turning {name} back on…"))));
+                if self.wake_and_probe(tv, mac, RESTART_WAKE_FOR).await {
+                    break 'done Recovered::Fixed;
+                }
+            }
+            let msg = format!("{name} still isn't answering. Trying again shortly…");
+            self.set_activity(tv, Some((Retrying, msg)));
+            tokio::time::sleep(RECOVERY_PAUSE).await;
+            Recovered::No
+        };
+        tracing::info!("{name}: getting it to answer: {outcome:?}");
+        self.set_activity(tv, None);
+        if outcome != Recovered::No {
+            self.refresh_status(tv, Prio::Background);
+        }
+        outcome
+    }
+
+    /// Connect afresh and see whether the art app answers; if it does, use that connection.
+    async fn probe(self: &Arc<Self>, tv: &Arc<Tv>) -> bool {
+        let art = match self.open_art(tv).await {
+            Ok(art) => art,
+            Err(e) => {
+                tracing::info!("{}: {e:#}", tv.name);
+                return false;
+            }
+        };
+        match art.request_with(json!({ "request": "get_api_version" }), None, PROBE_TIMEOUT).await {
+            Ok(_) => {
+                let art = self.adopt(art, &tv.name);
+                *tv.art.lock().await = Some(art);
+                tv.down.lock().unwrap().take();
+                self.answered(tv);
+                true
+            }
+            Err(e) => {
+                tracing::info!("{}: connected, but {e}", tv.name);
+                art.close().await;
+                false
+            }
+        }
+    }
+
+    /// Send Wake-on-LAN every few seconds until the art app answers, for up to `limit`.
+    async fn wake_and_probe(self: &Arc<Self>, tv: &Arc<Tv>, mac: &str, limit: Duration) -> bool {
+        let host = tv.config().host;
+        let start = Instant::now();
+        while start.elapsed() < limit {
+            for _ in 0..3 {
+                if let Err(e) = wol::wake(mac, Some(&host)) {
+                    tracing::warn!("{}: Wake-on-LAN: {e}", tv.name);
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            if rest_power(&host).await != api::Power::Off && self.probe(tv).await {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Hold the remote's power button (a short press only toggles art mode), then wait for the
+    /// TV to go away and come back in standby.
+    async fn power_cycle(&self, tv: &Tv) {
+        let cfg = tv.config();
+        let client_name = self.cfg.lock().unwrap().client_name.clone();
+        let endpoint = cfg.endpoint(&client_name);
+        let held = tokio::time::timeout(CONNECT_TIMEOUT + Duration::from_secs(10), async {
+            let mut remote = samsung_frame::remote::RemoteClient::connect(&endpoint).await?;
+            remote.hold("KEY_POWER", Duration::from_secs(4)).await?;
+            remote.close().await;
+            Ok::<(), samsung_frame::Error>(())
+        })
+        .await;
+        match held {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!("{}: holding the power button: {e}", tv.name),
+            Err(_) => tracing::warn!("{}: holding the power button: no answer", tv.name),
+        }
+        let start = Instant::now();
+        let mut went_away = false;
+        while start.elapsed() < Duration::from_secs(45) {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let power = rest_power(&cfg.host).await;
+            went_away |= power == api::Power::Off;
+            if went_away && power != api::Power::Off {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
     }
 
     /// Tell the TV to do something, ahead of anything that's only reading.
@@ -527,7 +843,7 @@ impl Hub {
         Fut: Future<Output = samsung_frame::Result<T>>,
     {
         let _turn = tv.queue.turn(Prio::Command).await;
-        self.call(tv, false, f).await
+        self.call(tv, Prio::Command, f).await
     }
 
     /// Ask the TV something, waiting for a turn at `prio`. Dropping the future (the page that
@@ -538,13 +854,14 @@ impl Hub {
         Fut: Future<Output = samsung_frame::Result<T>>,
     {
         let _turn = tv.queue.turn(prio).await;
-        self.call(tv, true, f).await
+        self.call(tv, prio, f).await
     }
 
     /// The status as last reported, without asking the TV.
     fn status(&self, tv: &Tv) -> api::Status {
         let mut s = tv.status.lock().unwrap().as_ref().map(|(s, _)| s.clone()).unwrap_or_default();
         s.sharing = self.share_session(tv).is_some();
+        s.activity.clone_from(&tv.activity.lock().unwrap());
         s
     }
 
@@ -569,15 +886,16 @@ impl Hub {
                 favorites: s.category_id.as_deref() == Some(category::FAVORITES),
             }),
             sharing: self.share_session(tv).is_some(),
+            activity: None,
         };
         let changed = {
             let mut slot = tv.status.lock().unwrap();
             let changed = slot.as_ref().is_none_or(|(s, _)| *s != status);
-            *slot = Some((status.clone(), Instant::now()));
+            *slot = Some((status, Instant::now()));
             changed
         };
         if changed {
-            self.emit(ServerEvent::Status { tv: tv.name.clone(), status });
+            self.emit(ServerEvent::Status { tv: tv.name.clone(), status: self.status(tv) });
         }
         Ok(())
     }
@@ -603,11 +921,12 @@ impl Hub {
     /// Ask the TV whether it's on (over plain HTTP, so it doesn't wait for a turn). Tells the
     /// pages if that changed.
     async fn check_power(self: &Arc<Self>, tv: &Arc<Tv>) -> api::Power {
-        let host = tv.config().host;
-        let power = match rest::device_info(&host, Duration::from_secs(2)).await {
-            Ok(i) => api::Power::from_tv(i.power_state()),
-            Err(_) => api::Power::Off,
-        };
+        let mut power = rest_power(&tv.config().host).await;
+        if power == api::Power::Standby
+            && tv.answered.lock().unwrap().is_some_and(|at| at.elapsed() < ANSWERED_RECENTLY)
+        {
+            power = api::Power::On;
+        }
         let before = tv.power.lock().unwrap().replace((power, Instant::now())).map(|(p, _)| p);
         if before != Some(power) {
             if power == api::Power::On {
@@ -641,7 +960,7 @@ impl Hub {
             let (hub, tv) = (Arc::clone(self), Arc::clone(tv));
             tokio::spawn(async move {
                 loop {
-                    let on = hub.check_power(&tv).await == api::Power::On;
+                    let on = hub.check_power(&tv).await != api::Power::Off;
                     if on && tv.status_age().is_none_or(|a| a >= WATCH_STATUS_EVERY) {
                         hub.refresh_status(&tv, Prio::Background);
                     }
@@ -677,14 +996,20 @@ impl Hub {
             }
             lists.get(cat).cloned()
         };
-        let maybe_on = tv.maybe_on();
-        if maybe_on && cached.as_ref().is_none_or(|s| !s.is_fresh(PHOTOS_FRESH)) {
+        // Asked even if it seems to be off: while someone has its page open, that wakes it.
+        if cached.as_ref().is_none_or(|s| !s.is_fresh(PHOTOS_FRESH)) {
             self.refresh_photos(tv, cat);
         }
-        let offline = tv
-            .down_reason()
-            .or_else(|| tv.photos_err.lock().unwrap().clone())
-            .or_else(|| (!maybe_on).then(|| format!("{} is off or asleep", tv.name)));
+        // While the server is getting the TV to answer, or asking it for a page that's open
+        // (which waits for the TV to answer), the photos are on their way.
+        let asking = tv.watched() && tv.refreshing.lock().unwrap().contains_key(cat);
+        let offline = if asking || tv.recovering() {
+            None
+        } else {
+            tv.down_reason()
+                .or_else(|| tv.photos_err.lock().unwrap().clone())
+                .or_else(|| (!tv.maybe_on()).then(|| format!("{} is off or asleep", tv.name)))
+        };
         (cached, offline)
     }
 
@@ -775,23 +1100,14 @@ impl Hub {
         });
     }
 
-    /// Prepare and upload a file, retrying once on a fresh connection.
+    /// Prepare and upload a file (waiting for the TV like any command).
     async fn upload_with_retry(
         self: &Arc<Self>,
         tv: &Arc<Tv>,
         path: &Path,
         settings: &sync::UploadSettings,
     ) -> anyhow::Result<sync::UploadResult> {
-        let _turn = tv.queue.turn(Prio::Command).await;
-        let art = self.art(tv).await?;
-        Ok(match sync::upload_file(&art, path, settings).await {
-            Err(e) if is_disconnect(&e) => {
-                tv.art.lock().await.take();
-                let art = self.art(tv).await?;
-                sync::upload_file(&art, path, settings).await?
-            }
-            other => other?,
-        })
+        self.with_art(tv, |a| async move { sync::upload_file(&a, path, settings).await }).await
     }
 
     /// Remove photos from the TV along with their cached thumbnails.
@@ -1422,7 +1738,8 @@ async fn forget_tv(
 async fn tv_status(State(hub): State<Shared>, UrlPath(name): UrlPath<String>) -> ApiResult<Json<api::Status>> {
     let tv = hub.tv(&name)?;
     // Answer from what's known; if that's not recent, a `status` event follows if it changed.
-    if tv.maybe_on() && tv.status_age().is_none_or(|a| a >= STATUS_FRESH) {
+    // Asked even if it seems to be off: while someone has its page open, that wakes it.
+    if tv.status_age().is_none_or(|a| a >= STATUS_FRESH) {
         hub.refresh_status(&tv, Prio::Read);
     }
     Ok(Json(hub.status(&tv)))
@@ -1566,7 +1883,7 @@ async fn fetch_thumbs(hub: &Shared, tv: &Arc<Tv>, ids: &[String], prio: Prio) ->
     };
 
     let batch = hub
-        .call(tv, false, |a| {
+        .call(tv, prio, |a| {
             let want = want.clone();
             async move { a.thumbnails(&want).await }
         })
@@ -1594,7 +1911,7 @@ async fn fetch_thumbs(hub: &Shared, tv: &Arc<Tv>, ids: &[String], prio: Prio) ->
     if !missing.is_empty() {
         for id in missing.clone() {
             let one = hub
-                .call(tv, false, |a| {
+                .call(tv, prio, |a| {
                     let id = id.clone();
                     async move { a.thumbnails_one_by_one(std::slice::from_ref(&id)).await }
                 })

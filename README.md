@@ -154,6 +154,13 @@ upkeep. Pages get their answers from what the server last heard and are told whe
 they load straight away even when a TV is slow. Requests from a page that was closed are dropped
 before they reach the TV. Commands, though, always finish once started.
 
+Requests don't time out when a TV is slow or stuck. They wait while the server gets it to answer,
+and the page shows what it's doing ("Waking Fireplace…", with a timer). It reconnects first, then
+sends Wake‑on‑LAN. If that doesn't work, it turns the TV off and on again by holding the power
+button. Some Frames' art app stops answering until that happens. A restart happens at most once
+every 15 minutes, and a TV that says it's on (someone may be watching it) is only restarted for a
+command such as sending a photo.
+
 ## Command line
 
 ```text
@@ -179,7 +186,8 @@ on Linux.
 - **Wake‑on‑LAN**: enable *Settings → General → Network → Expert Settings → Power On with
   Mobile* (wording varies by year). The TV's MAC address is recorded when you pair.
 - **Turned off vs. art mode**: in art mode the TV answers normally. When it's fully off (or
-  the motion sensor has blanked it), it shows as standby or off until woken.
+  the motion sensor has blanked it), it shows as standby or off until woken. Some TVs report
+  standby even while showing art, so the server counts a TV as on whenever its art app answers.
 - **Windows firewall** (running `frametv serve` natively): allow `frametv.exe` on private
   networks, or phones can't reach port 3273 / 53317.
 - **Models**: tested with 2020 Frames (LS03T). 2022+ models use the same art API. Some 2024
