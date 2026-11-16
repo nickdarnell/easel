@@ -64,6 +64,19 @@ version comes from `Cargo.toml`, and every build is also tagged `sha-<commit>`. 
 carries the usual OCI labels, plus the web UI link and icon Unraid shows and Watchtower's
 enable label.
 
+### Portainer
+
+Either paste the compose file above into **Stacks → Add stack**, or use the app template:
+under **Settings → App Templates**, set the URL to
+`https://raw.githubusercontent.com/nickdarnell/easel/main/portainer-template.json` (this
+replaces Portainer's built-in list), then pick **Easel** from **App Templates**. The template
+sets host networking, the environment variables and a `/config` volume.
+
+To update, open the stack and choose **Update the stack** with **Re-pull image and redeploy**
+on, or for a lone container, **Recreate** with **Re-pull image** on. Portainer's update
+indicator (when turned on for the environment) compares the image you have with the registry's
+for the same tag, so it works whether you follow `latest` or pin something like `0.1`.
+
 ### What's in /config
 
 | Path | |
